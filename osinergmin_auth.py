@@ -47,11 +47,19 @@ class AuthConfig:
     open_sne_after_login: bool = True
     require_sne_click_navigation: bool = True
     sne_menu_selector: str = (
+        "//mat-nav-list[@role='navigation']"
+        "//mat-list-item[.//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
+        "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']]"
         "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
         "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']"
     )
     sne_target_url: str = "https://notificaciones.osinergmin.gob.pe/sne-web/pages/notificacion/inicio"
     sne_expected_text: str = "Sistema de Notificaciones Electrónicas|Bandeja de Entrada"
+    fecha_notificacion_inicio: str = ""
+    fecha_notificacion_fin: str = ""
+    sne_fecha_inicio_id: str = "fechaNotificacionInicio"
+    sne_fecha_fin_id: str = "fechaNotificacionFin"
+    sne_buscar_button_id: str = "buscar-boton"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -325,6 +333,72 @@ def _wait_for_sne_home(driver, cfg: AuthConfig) -> bool:
         return False
 
 
+def _set_input_value(driver, element, value: str) -> None:
+    try:
+        element.clear()
+    except Exception:
+        pass
+
+    try:
+        element.send_keys(Keys.CONTROL, "a")
+        element.send_keys(Keys.DELETE)
+    except Exception:
+        pass
+
+    try:
+        element.send_keys(value)
+    except Exception:
+        driver.execute_script(
+            "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true})); arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+            element,
+            value,
+        )
+
+
+def _apply_sne_filters(driver, cfg: AuthConfig) -> bool:
+    """Llena fechas y ejecuta la busqueda en la bandeja del SNE."""
+    if not cfg.fecha_notificacion_inicio and not cfg.fecha_notificacion_fin:
+        return True
+
+    if not cfg.fecha_notificacion_inicio or not cfg.fecha_notificacion_fin:
+        logging.warning("Se omite la busqueda en SNE porque falta una de las dos fechas requeridas.")
+        return False
+
+    inicio = _find_first(driver, [(By.ID, cfg.sne_fecha_inicio_id)], cfg.timeout)
+    fin = _find_first(driver, [(By.ID, cfg.sne_fecha_fin_id)], cfg.timeout)
+    buscar = _find_first(
+        driver,
+        [
+            (By.ID, cfg.sne_buscar_button_id),
+            (By.XPATH, "//input[@type='button' and @id='buscar-boton']"),
+            (By.XPATH, "//input[@type='button' and @value='Buscar']"),
+        ],
+        cfg.timeout,
+    )
+
+    if inicio is None or fin is None or buscar is None:
+        logging.warning("No se encontraron los campos de fecha o el boton Buscar en la bandeja del SNE.")
+        return False
+
+    _set_input_value(driver, inicio, cfg.fecha_notificacion_inicio)
+    _set_input_value(driver, fin, cfg.fecha_notificacion_fin)
+    logging.info(
+        "Fechas de notificacion cargadas en SNE: inicio=%s fin=%s",
+        cfg.fecha_notificacion_inicio,
+        cfg.fecha_notificacion_fin,
+    )
+
+    if not _click_ingresar_button(driver, buscar):
+        try:
+            driver.execute_script("arguments[0].click();", buscar)
+        except Exception:
+            logging.warning("No se pudo hacer clic en el boton Buscar del SNE.")
+            return False
+
+    logging.info("Busqueda ejecutada en la bandeja del SNE.")
+    return True
+
+
 def _resolve_sne_menu_targets(driver, menu):
     if menu is None:
         return None, None
@@ -334,7 +408,7 @@ def _resolve_sne_menu_targets(driver, menu):
             """
 const el = arguments[0];
 if (!el) return null;
-return el.closest('mat-list-item, .mat-mdc-list-item, .mdc-list-item') || el;
+return el.closest('mat-list-item, .mat-mdc-list-item, .mdc-list-item, [role="listitem"]') || el;
 """,
             menu,
         )
@@ -354,6 +428,44 @@ return el.querySelector('.mat-mdc-list-item-title, .text-menu-parent') || el;
         title = menu
 
     return container, title
+
+
+def _find_sne_menu(driver, cfg: AuthConfig):
+    return _find_first(
+        driver,
+        [
+            (By.XPATH, cfg.sne_menu_selector),
+            (
+                By.XPATH,
+                "//mat-nav-list[@role='navigation']//mat-list-item"
+                "[.//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
+                "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']]",
+            ),
+            (
+                By.XPATH,
+                "//mat-nav-list[@role='navigation']//div[@matlistitemtitle "
+                "and contains(@class,'mat-mdc-list-item-title') "
+                "and contains(@class,'text-menu-parent') "
+                "and normalize-space()='Casilla Electrónica del SNE']",
+            ),
+            (
+                By.XPATH,
+                "//mat-list-item[.//mat-icon[@data-mat-icon-name='ico-mail'] "
+                "and .//div[normalize-space()='Casilla Electrónica del SNE']]",
+            ),
+            (
+                By.XPATH,
+                "//div[contains(@class, 'mat-mdc-list-item-title') "
+                "and contains(normalize-space(.), 'Casilla Electrónica del SNE')]",
+            ),
+            (
+                By.XPATH,
+                "//*[contains(normalize-space(.), 'Casilla Electrónica del SNE') "
+                "and (self::div or self::span or self::a)]",
+            ),
+        ],
+        cfg.timeout,
+    )
 
 
 def _perform_sne_click_attempt(driver, target, description: str, mode: str) -> bool:
@@ -475,17 +587,7 @@ def _click_sne_menu_and_switch_window(driver, cfg: AuthConfig) -> bool:
     url_before = driver.current_url or ""
 
     try:
-        menu = _find_first(
-            driver,
-            [
-                (By.XPATH, cfg.sne_menu_selector),
-                (By.XPATH, "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']"),
-                (By.XPATH, "//mat-list-item[.//mat-icon[@data-mat-icon-name='ico-mail'] and .//div[normalize-space()='Casilla Electrónica del SNE']]"),
-                (By.XPATH, "//div[contains(@class, 'mat-mdc-list-item-title') and contains(normalize-space(.), 'Casilla Electrónica del SNE')]"),
-                (By.XPATH, "//*[contains(normalize-space(.), 'Casilla Electrónica del SNE') and (self::div or self::span or self::a)]"),
-            ],
-            cfg.timeout,
-        )
+        menu = _find_sne_menu(driver, cfg)
     except Exception:
         menu = None
 
@@ -662,6 +764,7 @@ def _login_with_selenium(session: requests.Session, cfg: AuthConfig, username: s
 
         if cfg.open_sne_after_login:
             _click_sne_menu_and_switch_window(driver, cfg)
+            _apply_sne_filters(driver, cfg)
 
         # Copiamos cookies de Selenium a la sesion requests para siguientes pasos.
         for cookie in driver.get_cookies():
@@ -773,7 +876,11 @@ def main() -> None:
         "--sne-menu-selector",
         default=os.getenv(
             "OSI_SNE_MENU_SELECTOR",
-            "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']",
+            "//mat-nav-list[@role='navigation']"
+            "//mat-list-item[.//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
+            "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']]"
+            "//div[@matlistitemtitle and contains(@class,'mat-mdc-list-item-title') "
+            "and contains(@class,'text-menu-parent') and normalize-space()='Casilla Electrónica del SNE']",
         ),
         help="XPath/CSS (XPath recomendado) del menu SNE (env: OSI_SNE_MENU_SELECTOR)",
     )
@@ -792,6 +899,31 @@ def main() -> None:
             "Sistema de Notificaciones Electrónicas|Bandeja de Entrada",
         ),
         help="Textos esperados en pantalla SNE separados por | (env: OSI_SNE_EXPECTED_TEXT)",
+    )
+    parser.add_argument(
+        "--fecha-notificacion-inicio",
+        default=os.getenv("OSI_FECHA_NOTIFICACION_INICIO", ""),
+        help="Fecha inicial para buscar en SNE con formato dd/mm/yyyy (env: OSI_FECHA_NOTIFICACION_INICIO)",
+    )
+    parser.add_argument(
+        "--fecha-notificacion-fin",
+        default=os.getenv("OSI_FECHA_NOTIFICACION_FIN", ""),
+        help="Fecha final para buscar en SNE con formato dd/mm/yyyy (env: OSI_FECHA_NOTIFICACION_FIN)",
+    )
+    parser.add_argument(
+        "--sne-fecha-inicio-id",
+        default=os.getenv("OSI_SNE_FECHA_INICIO_ID", "fechaNotificacionInicio"),
+        help="ID del campo fecha inicial del SNE (env: OSI_SNE_FECHA_INICIO_ID)",
+    )
+    parser.add_argument(
+        "--sne-fecha-fin-id",
+        default=os.getenv("OSI_SNE_FECHA_FIN_ID", "fechaNotificacionFin"),
+        help="ID del campo fecha final del SNE (env: OSI_SNE_FECHA_FIN_ID)",
+    )
+    parser.add_argument(
+        "--sne-buscar-button-id",
+        default=os.getenv("OSI_SNE_BUSCAR_BUTTON_ID", "buscar-boton"),
+        help="ID del boton Buscar en el SNE (env: OSI_SNE_BUSCAR_BUTTON_ID)",
     )
     parser.add_argument(
         "--user-agent",
@@ -833,6 +965,11 @@ def main() -> None:
         sne_menu_selector=args.sne_menu_selector,
         sne_target_url=args.sne_target_url,
         sne_expected_text=args.sne_expected_text,
+        fecha_notificacion_inicio=args.fecha_notificacion_inicio,
+        fecha_notificacion_fin=args.fecha_notificacion_fin,
+        sne_fecha_inicio_id=args.sne_fecha_inicio_id,
+        sne_fecha_fin_id=args.sne_fecha_fin_id,
+        sne_buscar_button_id=args.sne_buscar_button_id,
         user_agent=args.user_agent,
     )
 

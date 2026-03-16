@@ -775,6 +775,48 @@ return true;
         return False
 
 
+def _click_lupa_by_notification_number(driver, notification_number: str) -> bool:
+    """Hace clic en la lupita buscando la fila por numero de notificacion."""
+    if not notification_number:
+        return False
+
+    try:
+        return bool(
+            driver.execute_script(
+                """
+const wanted = arguments[0];
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow')).filter((tr) => isVisible(tr));
+
+for (const row of rows) {
+    const cells = Array.from(row.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+    const rowText = (row.textContent || '').replace(/\\s+/g, ' ').trim();
+    const hasNotif = cells.some((v) => v === wanted) || rowText.includes(wanted);
+    if (!hasNotif) continue;
+
+    const icon = row.querySelector("img[title*='Lectura'], img[src*='icon_search.png']");
+    if (!icon || !isVisible(icon)) return false;
+    try { icon.scrollIntoView({ block: 'center' }); } catch (e) {}
+    ['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+        icon.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+    });
+    try { icon.click(); } catch (e) {}
+    return true;
+}
+
+return false;
+""",
+                notification_number,
+            )
+        )
+    except Exception:
+        return False
+
+
 def _click_documentos_notificados(driver, cfg: AuthConfig) -> bool:
     """Abre la seccion Documentos notificados dentro del detalle de notificacion."""
     link = _find_first(
@@ -884,7 +926,7 @@ const cells = Array.from(rows[idx].querySelectorAll('td')).map((td) => (td.textC
 for (const cell of cells) {
     if (/\\d{8,}-\\d+/.test(cell)) return cell;
 }
-const rowText = (rows[idx].textContent || '').replace(/\s+/g, ' ').trim();
+const rowText = (rows[idx].textContent || '').replace(/\\s+/g, ' ').trim();
 const match = rowText.match(/\\d{8,}-\\d+/);
 return match ? match[0] : '';
 """,
@@ -899,28 +941,98 @@ return match ? match[0] : '';
 
 
 def _move_download_to_notification_folder(file_path: Path, base_download_dir: Path, notification_number: str) -> Path:
-    """Mueve un archivo descargado a la carpeta de su numero de notificacion."""
-    folder_name = notification_number or "sin-numero-notificacion"
-    target_dir = base_download_dir / folder_name
+    """Mueve un archivo descargado a /YYYY-MM-DD/numero_suministro/."""
+    folder_name = notification_number or "sin-numero-suministro"
+    date_folder = datetime.now().strftime("%Y-%m-%d")
+    target_dir = base_download_dir / date_folder / folder_name
     target_dir.mkdir(parents=True, exist_ok=True)
 
     target_path = target_dir / file_path.name
     if target_path.exists():
-        stem = target_path.stem
-        suffix = target_path.suffix
-        i = 1
-        while True:
-            candidate = target_dir / f"{stem} ({i}){suffix}"
-            if not candidate.exists():
-                target_path = candidate
-                break
-            i += 1
+        try:
+            target_path.unlink()
+        except Exception:
+            pass
 
     try:
         file_path.replace(target_path)
     except Exception:
         return file_path
     return target_path
+
+
+def _get_notification_numbers_from_excel(excel_path: Path) -> list[str]:
+    """Lee todos los Nro. Notificacion desde el Excel exportado (primera columna)."""
+    try:
+        import openpyxl  # type: ignore[import-not-found]
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        ws = wb.active
+        numbers: list[str] = []
+        nro_col: int | None = None
+        for row in ws.iter_rows(values_only=True):
+            if nro_col is None:
+                # Detecta la columna 'Nro. Notificacion' en la cabecera
+                for i, cell in enumerate(row):
+                    if cell and "notif" in str(cell).lower():
+                        nro_col = i
+                        break
+                if nro_col is None:
+                    # Sin cabecera reconocible, usa columna 0
+                    nro_col = 0
+                continue
+            val = re.sub(r"[^0-9\-]", "", str(row[nro_col] or "")).strip("-")
+            if re.fullmatch(r"\d{8,}-\d+", val):
+                numbers.append(val)
+        wb.close()
+        logging.info("Numeros de notificacion leidos desde Excel (%s): %s", excel_path.name, numbers)
+        return numbers
+    except Exception as exc:
+        logging.warning("No se pudo leer numeros de notificacion desde Excel '%s': %s", excel_path, exc)
+        return []
+
+
+def _get_visible_notification_numbers(driver) -> list[str]:
+    """Obtiene numeros de notificacion visibles unicos del grid actual."""
+    try:
+        raw_list = driver.execute_script(
+            """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow')).filter((tr) => isVisible(tr));
+const out = [];
+for (const row of rows) {
+    const cells = Array.from(row.querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+    const direct = cells.find((v) => /\\d{8,}-\\d+/.test(v));
+    if (direct) {
+        out.push(direct);
+        continue;
+    }
+    const rowText = (row.textContent || '').replace(/\\s+/g, ' ').trim();
+    const m = rowText.match(/\\d{8,}-\\d+/);
+    if (m) out.push(m[0]);
+}
+return out;
+"""
+        )
+        numbers = []
+        for item in raw_list or []:
+            clean = re.sub(r"[^0-9\-]", "", str(item or "")).strip("-")
+            if clean:
+                numbers.append(clean)
+        # Unicos preservando orden
+        seen: set[str] = set()
+        unique = []
+        for n in numbers:
+            if n in seen:
+                continue
+            seen.add(n)
+            unique.append(n)
+        return unique
+    except Exception:
+        return []
 
 
 def _download_visible_document_links_for_notification(
@@ -932,11 +1044,10 @@ def _download_visible_document_links_for_notification(
     """Descarga links visibles de documentos y los organiza por numero de notificacion."""
     downloaded = 0
 
-    def _count_links() -> int:
+    def _get_unique_links() -> list[dict[str, str]]:
         try:
-            return int(
-                driver.execute_script(
-                    """
+            raw_links = driver.execute_script(
+                """
 const isVisible = (el) => {
     if (!el) return false;
     const style = window.getComputedStyle(el);
@@ -944,21 +1055,37 @@ const isVisible = (el) => {
 };
 const links = Array.from(document.querySelectorAll("a[title='Descargar archivo'], a[href*='descargarArchivoNotificacion']"))
     .filter((a) => isVisible(a));
-return links.length;
+const out = [];
+const seen = new Set();
+for (const a of links) {
+    const href = (a.getAttribute('href') || '').trim();
+    const text = (a.textContent || '').trim();
+    const key = href || text;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push({ href, text });
+}
+return out;
 """
-                )
             )
+            return list(raw_links or [])
         except Exception:
-            return 0
+            return []
 
-    link_count = _count_links()
-    for idx in range(link_count):
+    unique_links = _get_unique_links()
+    for link_data in unique_links:
+        href = str((link_data or {}).get("href", "") or "")
+        text = str((link_data or {}).get("text", "") or "")
+        if not href and not text:
+            continue
+
         before = _snapshot_downloads(download_dir)
         try:
             clicked = bool(
                 driver.execute_script(
                     """
-const index = arguments[0];
+const wantedHref = arguments[0];
+const wantedText = arguments[1];
 const isVisible = (el) => {
     if (!el) return false;
     const style = window.getComputedStyle(el);
@@ -966,16 +1093,18 @@ const isVisible = (el) => {
 };
 const links = Array.from(document.querySelectorAll("a[title='Descargar archivo'], a[href*='descargarArchivoNotificacion']"))
     .filter((a) => isVisible(a));
-if (index < 0 || index >= links.length) return false;
-const link = links[index];
-try { link.scrollIntoView({ block: 'center' }); } catch (e) {}
-['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
-    link.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+const link = links.find((a) => {
+    const href = (a.getAttribute('href') || '').trim();
+    const text = (a.textContent || '').trim();
+    return (wantedHref && href === wantedHref) || (!wantedHref && wantedText && text === wantedText);
 });
+if (!link) return false;
+try { link.scrollIntoView({ block: 'center' }); } catch (e) {}
 try { link.click(); } catch (e) {}
 return true;
 """,
-                    idx,
+                    href,
+                    text,
                 )
             )
         except Exception:
@@ -988,7 +1117,12 @@ return true;
         file_path = _wait_for_new_download(download_dir, before, max(10, cfg.export_wait_seconds))
         if file_path is not None:
             final_path = _move_download_to_notification_folder(file_path, download_dir, notification_number)
-            logging.info("Archivo movido a carpeta de notificacion %s: %s", notification_number or "sin-numero", final_path.name)
+            logging.info(
+                "Archivo movido a carpeta de suministro %s en fecha %s: %s",
+                notification_number or "sin-numero",
+                datetime.now().strftime("%Y-%m-%d"),
+                final_path.name,
+            )
             downloaded += 1
 
     return downloaded
@@ -1059,23 +1193,37 @@ def _click_regresar_sequence(driver, cfg: AuthConfig) -> None:
     time.sleep(0.35)
 
 
-def _download_documents_from_visible_results(driver, cfg: AuthConfig, download_dir: Path) -> int:
-    """Por cada resultado visible, abre detalle y descarga sus documentos notificados."""
+def _download_documents_from_visible_results(
+    driver,
+    cfg: AuthConfig,
+    download_dir: Path,
+    notification_numbers: list[str] | None = None,
+) -> int:
+    """Por cada notificacion (del Excel o del grid), abre detalle y descarga sus documentos."""
     total_downloads = 0
-    results_count = _get_visible_lupa_count(driver)
-    logging.info("Cantidad de lupas visibles: %s", results_count)
-    if results_count <= 0:
+    if notification_numbers is None:
+        notification_numbers = _get_visible_notification_numbers(driver)
+        logging.info("Notificaciones leidas del grid visible: %s", len(notification_numbers))
+    else:
+        logging.info("Notificaciones leidas del Excel exportado: %s", len(notification_numbers))
+    if not notification_numbers:
         return 0
 
-    for idx in range(results_count):
-        notification_number = _get_notification_number_by_index(driver, idx)
-        logging.info("Procesando notificacion %s de %s.", idx + 1, results_count)
-        if not _click_lupa_by_index(driver, idx):
-            logging.warning("No se pudo abrir la lupita de la notificacion %s.", idx + 1)
+    for idx, notification_number in enumerate(notification_numbers, start=1):
+        logging.info("Procesando notificacion %s de %s: %s", idx, len(notification_numbers), notification_number)
+
+        # Re-estabiliza la grilla antes de cada notificacion para evitar filas no clickeables.
+        buscar_btn = _find_first(driver, [(By.ID, cfg.sne_buscar_button_id)], 3)
+        if buscar_btn is not None:
+            _click_search_button_and_wait(driver, buscar_btn, cfg)
+            time.sleep(0.5)
+
+        if not _click_lupa_by_notification_number(driver, notification_number):
+            logging.warning("No se pudo abrir la lupita de la notificacion %s.", notification_number)
             continue
 
         if not _click_documentos_notificados(driver, cfg):
-            logging.warning("No se pudo abrir 'Documentos notificados' en la notificacion %s.", idx + 1)
+            logging.warning("No se pudo abrir 'Documentos notificados' en la notificacion %s.", notification_number)
             _click_regresar_sequence(driver, cfg)
             _close_visible_dialogs(driver)
             continue
@@ -1088,7 +1236,7 @@ def _download_documents_from_visible_results(driver, cfg: AuthConfig, download_d
             notification_number,
         )
         total_downloads += downloaded_here
-        logging.info("Documentos descargados en notificacion %s: %s", idx + 1, downloaded_here)
+        logging.info("Documentos descargados en notificacion %s: %s", notification_number, downloaded_here)
         _click_regresar_sequence(driver, cfg)
         _close_visible_dialogs(driver)
         time.sleep(0.4)
@@ -1363,11 +1511,18 @@ sel.value = val;
 
     logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
 
-    docs_downloaded = _download_documents_from_visible_results(driver, cfg, download_dir)
+    # Usa el Excel como fuente de verdad: contiene TODOS los Nro. Notificacion
+    # independientemente de la paginacion del grid.
+    excel_notification_numbers = _get_notification_numbers_from_excel(downloaded_file)
+    if not excel_notification_numbers:
+        logging.warning("No se leyeron numeros de notificacion desde el Excel; se usara el grid visible.")
+        excel_notification_numbers = None
+
+    docs_downloaded = _download_documents_from_visible_results(driver, cfg, download_dir, excel_notification_numbers)
     if docs_downloaded > 0:
         logging.info("Descarga de documentos notificados completada. Archivos descargados: %s", docs_downloaded)
     else:
-        logging.warning("No se descargaron documentos notificados desde las filas visibles.")
+        logging.warning("No se descargaron documentos notificados.")
 
     return True
 

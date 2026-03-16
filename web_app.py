@@ -27,16 +27,12 @@ if not DB_PATH.is_absolute():
 PAGE_SIZE_DEFAULT = int(os.getenv("OSI_WEB_PAGE_SIZE", "10"))
 COLUMNS_TO_DISPLAY = [
     "nro__notificacion",
-    "nro__expediente",
-    "procedimiento",
     "asunto",
     "fecha_de_notificacion",
-    "estado_de_lectura",
-    "col_10",
     "fecha_importacion",
 ]
 
-UPDATE_STATE = {"running": False, "progress": 0, "error": None}
+UPDATE_STATE = {"running": False, "progress": 0, "error": None, "message": ""}
 
 
 def _run_update():
@@ -44,24 +40,40 @@ def _run_update():
     try:
         UPDATE_STATE["running"] = True
         UPDATE_STATE["error"] = None
+        UPDATE_STATE["message"] = "Iniciando actualización incremental..."
         UPDATE_STATE["progress"] = 10
 
         script_path = WORKSPACE_DIR / "osinergmin_auth.py"
         result = subprocess.run(
-            [str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"), str(script_path)],
+            [
+                str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"),
+                str(script_path),
+                "--incremental-only",
+                "--skip-existing-notifications",
+            ],
             cwd=str(WORKSPACE_DIR),
             capture_output=True,
             text=True,
             timeout=600,
         )
 
+        combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
+
         if result.returncode == 0:
             UPDATE_STATE["progress"] = 100
+            if "No hay notificaciones nuevas o pendientes por descargar." in combined_output:
+                UPDATE_STATE["message"] = "No hay nada nuevo para descargar."
+            elif "No se descargaron documentos notificados." in combined_output:
+                UPDATE_STATE["message"] = "No hubo documentos nuevos para descargar."
+            else:
+                UPDATE_STATE["message"] = "Actualización completada."
         else:
             UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}"
+            UPDATE_STATE["message"] = "La actualización terminó con error."
     except Exception as e:
         UPDATE_STATE["error"] = str(e)
         UPDATE_STATE["progress"] = 0
+        UPDATE_STATE["message"] = "Error durante la actualización."
     finally:
         UPDATE_STATE["running"] = False
 
@@ -257,6 +269,18 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       font-size: 13px;
       color: #0d4a8f;
     }}
+    .accordion-row {{ display: none; background: #f8fbff; }}
+    .accordion-row.open {{ display: table-row; }}
+    .accordion-cell {{ padding: 14px 12px !important; }}
+    .accordion-box {{
+      border: 1px solid #d7e6f7;
+      border-radius: 8px;
+      background: #fff;
+      padding: 10px 12px;
+    }}
+    .docs-empty {{ color: var(--muted); font-size: 13px; }}
+    .docs-list {{ margin: 0; padding-left: 18px; }}
+    .docs-list li {{ margin: 6px 0; }}
   </style>
 </head>
 <body>
@@ -286,7 +310,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
             
             if(!status.running) {{
               clearInterval(checkInterval);
-              document.getElementById('updateProgress').textContent = '¡Completado! Recargando...';
+              document.getElementById('updateProgress').textContent = status.message || '¡Completado! Recargando...';
               setTimeout(() => {{
                 modal.classList.remove('active');
                 btn.disabled = false;
@@ -303,6 +327,43 @@ def _html_page(title: str, body: str) -> HTMLResponse:
         alert('Error de conexión: ' + err);
         modal.classList.remove('active');
         btn.disabled = false;
+      }}
+    }}
+
+    async function toggleDocs(btn, numero, rowId) {{
+      const row = document.getElementById(`docs-row-${{rowId}}`);
+      const body = document.getElementById(`docs-body-${{rowId}}`);
+      if (!row || !body) return;
+
+      if (row.classList.contains('open')) {{
+        row.classList.remove('open');
+        btn.textContent = 'Ver documentos';
+        return;
+      }}
+
+      row.classList.add('open');
+      btn.textContent = 'Ocultar documentos';
+
+      if (body.dataset.loaded === '1') return;
+      body.innerHTML = '<div class="docs-empty">Cargando documentos...</div>';
+
+      try {{
+        const resp = await fetch(`/api/notificaciones/${{encodeURIComponent(numero)}}/documentos`);
+        const data = await resp.json();
+        if (!data || !Array.isArray(data.files) || data.files.length === 0) {{
+          body.innerHTML = '<div class="docs-empty">No hay documentos para esta notificación.</div>';
+          body.dataset.loaded = '1';
+          return;
+        }}
+
+        const items = data.files.map((f) => (
+          `<li><a href="${{f.href}}" target="_blank"><strong>${{f.name}}</strong></a> ` +
+          `<span class="muted">(${{f.date_folder}} | ${{f.size_kb}} KB)</span></li>`
+        )).join('');
+        body.innerHTML = `<ul class="docs-list">${{items}}</ul>`;
+        body.dataset.loaded = '1';
+      }} catch (err) {{
+        body.innerHTML = '<div class="docs-empty">No se pudo cargar el detalle de documentos.</div>';
       }}
     }}
   </script>
@@ -339,6 +400,7 @@ def estado():
         "running": UPDATE_STATE["running"],
         "progress": UPDATE_STATE["progress"],
         "error": UPDATE_STATE["error"],
+      "message": UPDATE_STATE["message"],
     })
 
 
@@ -401,12 +463,22 @@ def index(
             tds.append(f"<td>{html.escape(val[:50])}</td>" if len(val) > 50 else f"<td>{html.escape(val)}</td>")
 
         notif = str(row[notif_col]) if notif_col and row[notif_col] else ""
+        row_id = int(row["rowid"])
         if notif:
-            docs_link = f"<a class='btn secondary' href='/notificaciones/{quote(notif)}/documentos'>Ver documentos</a>"
+            docs_link = (
+                f"<button type='button' class='btn secondary' "
+                f"onclick=\"toggleDocs(this, '{html.escape(notif)}', {row_id})\">Ver documentos</button>"
+            )
         else:
             docs_link = "<span class='muted'>Sin Nro.</span>"
         tds.append(f"<td>{docs_link}</td>")
+
         body_rows.append("<tr>" + "".join(tds) + "</tr>")
+        body_rows.append(
+            "<tr id='docs-row-{}' class='accordion-row'><td colspan='{}' class='accordion-cell'>"
+            "<div id='docs-body-{}' class='accordion-box' data-loaded='0'></div>"
+            "</td></tr>".format(row_id, len(display_cols) + 1, row_id)
+        )
 
     prev_page = max(1, page - 1)
     next_page = page + 1
@@ -482,6 +554,30 @@ def documentos(numero: str) -> HTMLResponse:
 </div>
 """
     return _html_page(f"Documentos {numero}", body)
+
+
+@app.get("/api/notificaciones/{numero}/documentos")
+def documentos_api(numero: str):
+    docs = sorted(DOWNLOADS_DIR.glob(f"*/{numero}/*"), key=lambda p: p.name.lower())
+    files: list[dict[str, str]] = []
+    for path in docs:
+        relative = path.relative_to(DOWNLOADS_DIR).as_posix()
+        href = f"/files/{quote(relative)}"
+        date_folder = path.parents[1].name if len(path.parents) > 1 else ""
+        try:
+            size_kb = f"{path.stat().st_size / 1024:.2f}"
+        except OSError:
+            size_kb = "0.00"
+        files.append(
+            {
+                "name": path.name,
+                "href": href,
+                "date_folder": date_folder,
+                "size_kb": size_kb,
+            }
+        )
+
+    return JSONResponse({"numero": numero, "files": files})
 
 
 @app.get("/files/{file_path:path}")

@@ -76,6 +76,8 @@ class AuthConfig:
     download_dir: str = "downloads"
     export_wait_seconds: int = 40
     target_notifications: tuple[str, ...] = ()
+    incremental_only: bool = False
+    skip_existing_notifications: bool = False
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1110,6 +1112,26 @@ def _move_download_to_notification_folder(file_path: Path, base_download_dir: Pa
     return target_path
 
 
+def _get_notifications_with_downloads(base_download_dir: Path) -> set[str]:
+    """Obtiene Nro. Notificacion que ya tienen archivos descargados en cualquier fecha."""
+    existing: set[str] = set()
+    pattern = re.compile(r"\d{8,}-\d+")
+    if not base_download_dir.exists():
+        return existing
+
+    for candidate in base_download_dir.rglob("*"):
+        if not candidate.is_dir() or not pattern.fullmatch(candidate.name):
+            continue
+        try:
+            has_files = any(p.is_file() for p in candidate.iterdir())
+        except Exception:
+            has_files = False
+        if has_files:
+            existing.add(candidate.name)
+
+    return existing
+
+
 def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
     """Lee el Excel exportado y guarda/actualiza todas las filas en SQLite.
     Retorna la cantidad de filas insertadas o actualizadas."""
@@ -1835,6 +1857,20 @@ sel.value = val;
             len(excel_notification_numbers or []),
         )
 
+    if excel_notification_numbers and (cfg.incremental_only or cfg.skip_existing_notifications):
+        already_downloaded = _get_notifications_with_downloads(download_dir)
+        total_before = len(excel_notification_numbers)
+        excel_notification_numbers = [n for n in excel_notification_numbers if n not in already_downloaded]
+        logging.info(
+            "Modo incremental: %s pendientes de %s totales (ya descargadas: %s).",
+            len(excel_notification_numbers),
+            total_before,
+            max(0, total_before - len(excel_notification_numbers)),
+        )
+        if not excel_notification_numbers:
+            logging.info("No hay notificaciones nuevas o pendientes por descargar.")
+            return True
+
     docs_downloaded = _download_documents_from_visible_results(driver, cfg, download_dir, excel_notification_numbers)
     if docs_downloaded > 0:
         logging.info("Descarga de documentos notificados completada. Archivos descargados: %s", docs_downloaded)
@@ -2543,6 +2579,18 @@ def main() -> None:
         help="Lista de Nro. Notificacion separados por coma/espacio para procesar solo esos (env: OSI_TARGET_NOTIFICATIONS)",
     )
     parser.add_argument(
+        "--incremental-only",
+        action="store_true",
+        default=_env_bool("OSI_INCREMENTAL_ONLY", False),
+        help="Solo procesa notificaciones nuevas o pendientes (env: OSI_INCREMENTAL_ONLY)",
+    )
+    parser.add_argument(
+        "--skip-existing-notifications",
+        action="store_true",
+        default=_env_bool("OSI_SKIP_EXISTING_NOTIFICATIONS", False),
+        help="No vuelve a descargar notificaciones que ya tienen archivos (env: OSI_SKIP_EXISTING_NOTIFICATIONS)",
+    )
+    parser.add_argument(
         "--user-agent",
         default=os.getenv(
             "OSI_USER_AGENT",
@@ -2592,6 +2640,8 @@ def main() -> None:
         download_dir=args.download_dir,
         export_wait_seconds=args.export_wait_seconds,
         target_notifications=_parse_target_notifications(args.target_notifications),
+        incremental_only=args.incremental_only,
+        skip_existing_notifications=args.skip_existing_notifications,
         user_agent=args.user_agent,
     )
 

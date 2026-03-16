@@ -4,6 +4,7 @@ import argparse
 import csv
 import logging
 import os
+import re
 import time
 import unicodedata
 from datetime import datetime
@@ -865,6 +866,134 @@ return true;
     return downloaded
 
 
+def _get_notification_number_by_index(driver, index: int) -> str:
+    """Obtiene el numero de notificacion de una fila visible por indice."""
+    try:
+        raw_value = str(
+            driver.execute_script(
+                """
+const idx = arguments[0];
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const rows = Array.from(document.querySelectorAll('table.ui-jqgrid-btable tr.jqgrow')).filter((tr) => isVisible(tr));
+if (idx < 0 || idx >= rows.length) return '';
+const cells = Array.from(rows[idx].querySelectorAll('td')).map((td) => (td.textContent || '').trim());
+for (const cell of cells) {
+    if (/\\d{8,}-\\d+/.test(cell)) return cell;
+}
+const rowText = (rows[idx].textContent || '').replace(/\s+/g, ' ').trim();
+const match = rowText.match(/\\d{8,}-\\d+/);
+return match ? match[0] : '';
+""",
+                index,
+            )
+        )
+    except Exception:
+        raw_value = ""
+
+    clean = re.sub(r"[^0-9\-]", "", raw_value or "").strip("-")
+    return clean
+
+
+def _move_download_to_notification_folder(file_path: Path, base_download_dir: Path, notification_number: str) -> Path:
+    """Mueve un archivo descargado a la carpeta de su numero de notificacion."""
+    folder_name = notification_number or "sin-numero-notificacion"
+    target_dir = base_download_dir / folder_name
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    target_path = target_dir / file_path.name
+    if target_path.exists():
+        stem = target_path.stem
+        suffix = target_path.suffix
+        i = 1
+        while True:
+            candidate = target_dir / f"{stem} ({i}){suffix}"
+            if not candidate.exists():
+                target_path = candidate
+                break
+            i += 1
+
+    try:
+        file_path.replace(target_path)
+    except Exception:
+        return file_path
+    return target_path
+
+
+def _download_visible_document_links_for_notification(
+    driver,
+    cfg: AuthConfig,
+    download_dir: Path,
+    notification_number: str,
+) -> int:
+    """Descarga links visibles de documentos y los organiza por numero de notificacion."""
+    downloaded = 0
+
+    def _count_links() -> int:
+        try:
+            return int(
+                driver.execute_script(
+                    """
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const links = Array.from(document.querySelectorAll("a[title='Descargar archivo'], a[href*='descargarArchivoNotificacion']"))
+    .filter((a) => isVisible(a));
+return links.length;
+"""
+                )
+            )
+        except Exception:
+            return 0
+
+    link_count = _count_links()
+    for idx in range(link_count):
+        before = _snapshot_downloads(download_dir)
+        try:
+            clicked = bool(
+                driver.execute_script(
+                    """
+const index = arguments[0];
+const isVisible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetParent !== null;
+};
+const links = Array.from(document.querySelectorAll("a[title='Descargar archivo'], a[href*='descargarArchivoNotificacion']"))
+    .filter((a) => isVisible(a));
+if (index < 0 || index >= links.length) return false;
+const link = links[index];
+try { link.scrollIntoView({ block: 'center' }); } catch (e) {}
+['pointerdown','mousedown','pointerup','mouseup','click'].forEach((t) => {
+    link.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+});
+try { link.click(); } catch (e) {}
+return true;
+""",
+                    idx,
+                )
+            )
+        except Exception:
+            clicked = False
+
+        if not clicked:
+            continue
+
+        _accept_browser_alert_if_present(driver)
+        file_path = _wait_for_new_download(download_dir, before, max(10, cfg.export_wait_seconds))
+        if file_path is not None:
+            final_path = _move_download_to_notification_folder(file_path, download_dir, notification_number)
+            logging.info("Archivo movido a carpeta de notificacion %s: %s", notification_number or "sin-numero", final_path.name)
+            downloaded += 1
+
+    return downloaded
+
+
 def _close_visible_dialogs(driver) -> None:
     """Intenta cerrar dialogs/modales visibles para volver al listado."""
     try:
@@ -939,6 +1068,7 @@ def _download_documents_from_visible_results(driver, cfg: AuthConfig, download_d
         return 0
 
     for idx in range(results_count):
+        notification_number = _get_notification_number_by_index(driver, idx)
         logging.info("Procesando notificacion %s de %s.", idx + 1, results_count)
         if not _click_lupa_by_index(driver, idx):
             logging.warning("No se pudo abrir la lupita de la notificacion %s.", idx + 1)
@@ -951,7 +1081,12 @@ def _download_documents_from_visible_results(driver, cfg: AuthConfig, download_d
             continue
 
         time.sleep(0.4)
-        downloaded_here = _download_visible_document_links(driver, cfg, download_dir)
+        downloaded_here = _download_visible_document_links_for_notification(
+            driver,
+            cfg,
+            download_dir,
+            notification_number,
+        )
         total_downloads += downloaded_here
         logging.info("Documentos descargados en notificacion %s: %s", idx + 1, downloaded_here)
         _click_regresar_sequence(driver, cfg)

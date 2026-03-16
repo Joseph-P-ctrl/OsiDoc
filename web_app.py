@@ -6,15 +6,36 @@ import re
 import sqlite3
 import subprocess
 import threading
+import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+WORKSPACE_DIR = Path(__file__).resolve().parent
+
+
+def _load_dotenv(dotenv_path: Path) -> None:
+  if not dotenv_path.exists() or not dotenv_path.is_file():
+    return
+
+  for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+      continue
+    key, value = line.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if key and key not in os.environ:
+      os.environ[key] = value
+
+
+_load_dotenv(WORKSPACE_DIR / ".env")
+
 app = FastAPI(title="OsiDOc Viewer", version="1.0.0")
 
-WORKSPACE_DIR = Path(__file__).resolve().parent
 _DOWNLOADS_ENV = os.getenv("OSI_DOWNLOAD_DIR", "downloads")
 DOWNLOADS_DIR = Path(_DOWNLOADS_ENV)
 if not DOWNLOADS_DIR.is_absolute():
@@ -25,7 +46,8 @@ DB_PATH = Path(_DB_ENV)
 if not DB_PATH.is_absolute():
     DB_PATH = (WORKSPACE_DIR / DB_PATH).resolve()
 
-PAGE_SIZE_DEFAULT = int(os.getenv("OSI_WEB_PAGE_SIZE", "10"))
+PAGE_SIZE_FIXED = 10
+REMOTE_CHECK_STALE_MINUTES = int(os.getenv("OSI_REMOTE_CHECK_STALE_MINUTES", "10"))
 COLUMNS_TO_DISPLAY = [
     "nro__notificacion",
     "asunto",
@@ -97,22 +119,92 @@ def _find_notification_column(columns: list[str]) -> str | None:
     return None
 
 
+def _find_due_date_column(columns: list[str]) -> str | None:
+  for col in columns:
+    c = col.lower()
+    if "venc" in c and "fecha" in c:
+      return col
+  for col in columns:
+    if "venc" in col.lower():
+      return col
+  return None
+
+
+def _normalize_text(value: str) -> str:
+  normalized = unicodedata.normalize("NFD", value or "")
+  without_accents = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+  return without_accents.lower().strip()
+
+
+def _infer_document_type(text: str) -> str:
+  t = _normalize_text(text)
+
+  if "coactiva" in t or "cobranza" in t:
+    return "Cobranza coactiva"
+  if "resolucion" in t:
+    return "Resolucion"
+  if "requerimiento" in t:
+    return "Requerimiento"
+  if "oficio" in t:
+    return "Oficio"
+  if "informe" in t:
+    return "Informe"
+  return "No identificado"
+
+
 def _notifications_with_files(base_dir: Path) -> set[str]:
-  out: set[str] = set()
-  pat = re.compile(r"\d{8,}-\d+")
-  if not base_dir.exists():
+    out: set[str] = set()
+    pat = re.compile(r"\d{8,}-\d+")
+    if not base_dir.exists():
+        return out
+
+    for folder in base_dir.rglob("*"):
+        if not folder.is_dir() or not pat.fullmatch(folder.name):
+            continue
+        try:
+            has_file = any(p.is_file() for p in folder.iterdir())
+        except Exception:
+            has_file = False
+        if has_file:
+            out.add(folder.name)
     return out
 
-  for folder in base_dir.rglob("*"):
-    if not folder.is_dir() or not pat.fullmatch(folder.name):
-      continue
+
+def _get_pending_notifications() -> list[str]:
+    """Notificaciones en BD que aun no tienen archivos descargados."""
+    if not DB_PATH.exists():
+        return []
+
+    with _connect() as con:
+        columns = _get_table_columns(con)
+        notif_col = _find_notification_column(columns)
+        if not notif_col:
+            return []
+
+        q = f'SELECT DISTINCT "{notif_col}" FROM notificaciones WHERE "{notif_col}" IS NOT NULL AND TRIM("{notif_col}") <> ""'
+        db_notifs = {str(r[0]).strip() for r in con.execute(q).fetchall() if str(r[0] or "").strip()}
+
+    downloaded_notifs = _notifications_with_files(DOWNLOADS_DIR)
+    return sorted(n for n in db_notifs if n not in downloaded_notifs)
+
+
+def _minutes_since_last_sync() -> int | None:
+    """Minutos desde la ultima modificacion de la BD local."""
     try:
-      has_file = any(p.is_file() for p in folder.iterdir())
-    except Exception:
-      has_file = False
-    if has_file:
-      out.add(folder.name)
-  return out
+        if not DB_PATH.exists():
+            return None
+        elapsed_seconds = max(0.0, time.time() - DB_PATH.stat().st_mtime)
+        return int(elapsed_seconds // 60)
+    except OSError:
+        return None
+
+
+def _remote_check_required() -> tuple[bool, int | None]:
+    """Indica si conviene forzar una verificacion remota en SNE."""
+    minutes = _minutes_since_last_sync()
+    if minutes is None:
+        return True, None
+    return minutes >= REMOTE_CHECK_STALE_MINUTES, minutes
 
 
 def _html_page(title: str, body: str) -> HTMLResponse:
@@ -124,28 +216,33 @@ def _html_page(title: str, body: str) -> HTMLResponse:
   <title>{html.escape(title)}</title>
   <style>
     :root {{
-      --bg: #f4f6f8;
+      --bg: #eff4fb;
       --card: #ffffff;
-      --ink: #13212f;
-      --muted: #5d6b78;
-      --brand: #0f5aa5;
-      --line: #d9e1e8;
-      --accent: #f3f8fe;
-      --success: #27ae60;
+      --ink: #132236;
+      --muted: #607188;
+      --brand: #0057b8;
+      --brand-2: #0284c7;
+      --line: #d3dfec;
+      --accent: #eef6ff;
+      --success: #1f9d55;
+      --shadow: 0 18px 42px rgba(11, 36, 66, 0.13);
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      font-family: "Trebuchet MS", "Lucida Sans Unicode", "Lucida Grande", "Lucida Sans", Arial, sans-serif;
       color: var(--ink);
-      background: radial-gradient(circle at top right, #deebf9 0, var(--bg) 45%);
+      background:
+        radial-gradient(circle at 8% 5%, rgba(2, 132, 199, 0.14), transparent 40%),
+        radial-gradient(circle at 95% 0%, rgba(0, 87, 184, 0.18), transparent 35%),
+        linear-gradient(180deg, #f5f9ff 0%, var(--bg) 70%);
     }}
-    .wrap {{ max-width: 1380px; margin: 0 auto; padding: 20px; }}
+    .wrap {{ max-width: 1440px; margin: 0 auto; padding: 24px; }}
     .card {{
       background: var(--card);
       border: 1px solid var(--line);
-      border-radius: 12px;
-      box-shadow: 0 8px 24px rgba(10, 28, 46, 0.06);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
       overflow: hidden;
     }}
     .head {{
@@ -153,21 +250,21 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       justify-content: space-between;
       align-items: center;
       gap: 20px;
-      background: linear-gradient(110deg, #0f5aa5, #2f7ec6);
+      background: linear-gradient(112deg, #003d88 0%, #0057b8 52%, #0284c7 100%);
       color: #fff;
-      padding: 16px 20px;
+      padding: 18px 22px;
       flex-wrap: wrap;
     }}
     .head > div:first-child {{ flex: 1; }}
-    .head h1 {{ margin: 0; font-size: 20px; font-weight: 600; }}
-    .meta {{ font-size: 12px; opacity: 0.9; margin-top: 4px; }}
-    .content {{ padding: 18px; }}
+    .head h1 {{ margin: 0; font-size: 24px; font-weight: 700; letter-spacing: 0.2px; }}
+    .meta {{ font-size: 13px; opacity: 0.92; margin-top: 6px; }}
+    .content {{ padding: 20px; }}
     .toolbar {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; align-items: center; }}
     input[type=text] {{
       min-width: 260px;
       flex: 1;
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 10px;
       padding: 10px 12px;
       font-size: 14px;
       transition: all 0.2s;
@@ -179,10 +276,10 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     }}
     button, .btn {{
       border: 0;
-      border-radius: 8px;
+      border-radius: 10px;
       background: var(--brand);
       color: #fff;
-      padding: 10px 14px;
+      padding: 10px 15px;
       text-decoration: none;
       font-size: 14px;
       font-weight: 500;
@@ -204,14 +301,14 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       cursor: not-allowed;
       transform: none;
     }}
-    .btn.secondary {{ background: #4e6479; }}
-    .btn.secondary:hover {{ background: #3d545f; }}
+    .btn.secondary {{ background: #425f7f; }}
+    .btn.secondary:hover {{ background: #2f4a67; }}
     .btn.refresh {{
-      background: linear-gradient(110deg, #27ae60, #2ecc71);
-      padding: 10px 16px;
+      background: linear-gradient(110deg, #1f9d55, #3abf72);
+      padding: 10px 18px;
       font-weight: 600;
     }}
-    .btn.refresh:hover {{ background: linear-gradient(110deg, #229954, #27ae60); }}
+    .btn.refresh:hover {{ background: linear-gradient(110deg, #188a4a, #2eab63); }}
     .spinner {{
       display: inline-block;
       width: 14px;
@@ -259,9 +356,9 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     }}
     .modal-text {{ color: var(--muted); font-size: 14px; line-height: 1.5; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ border-bottom: 1px solid var(--line); padding: 10px; text-align: left; vertical-align: top; }}
-    th {{ background: var(--accent); position: sticky; top: 0; font-weight: 600; color: var(--brand); }}
-    .table-wrap {{ max-height: 70vh; overflow: auto; border: 1px solid var(--line); border-radius: 10px; }}
+    th, td {{ border-bottom: 1px solid var(--line); padding: 11px 10px; text-align: left; vertical-align: top; }}
+    th {{ background: var(--accent); position: sticky; top: 0; font-weight: 700; color: #0b3f76; z-index: 2; }}
+    .table-wrap {{ max-height: 72vh; overflow: auto; border: 1px solid var(--line); border-radius: 12px; background: #fff; }}
     tr:hover {{ background: #fafbfc; }}
     .muted {{ color: var(--muted); font-size: 13px; }}
     .badge {{
@@ -280,13 +377,48 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     .file-list a {{ color: var(--brand); text-decoration: none; font-weight: 500; }}
     .file-list a:hover {{ text-decoration: underline; }}
     .info-box {{
-      background: #eaf3ff;
+      background: #edf5ff;
       border-left: 4px solid var(--brand);
-      border-radius: 6px;
+      border-radius: 10px;
       padding: 12px 14px;
       margin-bottom: 12px;
       font-size: 13px;
       color: #0d4a8f;
+    }}
+    .kpi-row {{ display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }}
+    .kpi {{
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 10px 12px;
+      min-width: 160px;
+      box-shadow: 0 5px 16px rgba(11, 36, 66, 0.06);
+    }}
+    .kpi .k-label {{ font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }}
+    .kpi .k-value {{ font-size: 18px; font-weight: 700; color: #0b3f76; margin-top: 2px; }}
+    .pager {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }}
+    .pager-group {{ display: inline-flex; gap: 8px; }}
+    .page-chip {{
+      border: 1px solid #b8d2ef;
+      background: #eef6ff;
+      color: #1b4f86;
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .btn.disabled {{
+      pointer-events: none;
+      opacity: 0.45;
+      box-shadow: none;
+      transform: none;
     }}
     .accordion-row {{ display: none; background: #f8fbff; }}
     .accordion-row.open {{ display: table-row; }}
@@ -300,6 +432,28 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     .docs-empty {{ color: var(--muted); font-size: 13px; }}
     .docs-list {{ margin: 0; padding-left: 18px; }}
     .docs-list li {{ margin: 6px 0; }}
+    .floating-alert {{
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 1200;
+      min-width: 280px;
+      max-width: 360px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #edf9f1;
+      color: #1d7d46;
+      box-shadow: 0 14px 30px rgba(10, 28, 46, 0.16);
+      padding: 12px 14px;
+      display: none;
+    }}
+    .floating-alert.show {{ display: block; }}
+    .floating-alert.pending {{ background: #fff6e8; color: #9a5b00; border-color: #f2d39a; }}
+    .floating-alert.check {{ background: #f6f2ff; color: #4d3b8f; border-color: #d8cbf7; }}
+    .fa-title {{ font-weight: 700; margin-bottom: 6px; }}
+    .fa-text {{ font-size: 13px; line-height: 1.4; }}
+    .fa-actions {{ margin-top: 10px; text-align: right; }}
+    .fa-actions .btn {{ padding: 8px 10px; font-size: 13px; }}
   </style>
 </head>
 <body>
@@ -311,11 +465,20 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       <p class=\"modal-text\" id=\"updateProgress\">Conectando con el servidor...</p>
     </div>
   </div>
+  <div id="floatingAlert" class="floating-alert" aria-live="polite">
+    <div class="fa-title" id="floatingAlertTitle">Estado de descargas</div>
+    <div class="fa-text" id="floatingAlertText">Verificando pendientes...</div>
+    <div class="fa-actions">
+      <button id="floatingUpdateBtn" type="button" class="btn refresh" onclick="abrirActualizacion(event)">Actualizar</button>
+    </div>
+  </div>
   <script>
-    async function abrirActualizacion() {{
+    async function abrirActualizacion(evt) {{
       const modal = document.getElementById('updateModal');
-      const btn = event.target.closest('button');
-      btn.disabled = true;
+      const btn = (evt && evt.target && evt.target.closest('button'))
+        ? evt.target.closest('button')
+        : document.querySelector('.btn.refresh');
+      if (btn) btn.disabled = true;
       modal.classList.add('active');
       
       try {{
@@ -332,7 +495,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
               document.getElementById('updateProgress').textContent = status.message || '¡Completado! Recargando...';
               setTimeout(() => {{
                 modal.classList.remove('active');
-                btn.disabled = false;
+                if (btn) btn.disabled = false;
                 location.reload();
               }}, 1500);
             }}
@@ -340,14 +503,64 @@ def _html_page(title: str, body: str) -> HTMLResponse:
         }} else {{
           alert('Error: ' + (data.error || 'Desconocido'));
           modal.classList.remove('active');
-          btn.disabled = false;
+          if (btn) btn.disabled = false;
         }}
       }} catch(err) {{
         alert('Error de conexión: ' + err);
         modal.classList.remove('active');
-        btn.disabled = false;
+        if (btn) btn.disabled = false;
       }}
     }}
+
+    async function refreshFloatingAlert() {{
+      const box = document.getElementById('floatingAlert');
+      const title = document.getElementById('floatingAlertTitle');
+      const text = document.getElementById('floatingAlertText');
+      const btn = document.getElementById('floatingUpdateBtn');
+      if (!box || !title || !text || !btn) return;
+
+      try {{
+        const res = await fetch('/api/pending');
+        const data = await res.json();
+        const pending = Number(data.pending_count || 0);
+        const needsCheck = Boolean(data.needs_remote_check);
+        const minutesSinceSync = data.minutes_since_last_sync;
+        box.classList.add('show');
+        box.classList.remove('check');
+
+        if (pending > 0) {{
+          box.classList.add('pending');
+          title.textContent = 'Hay novedades';
+          text.textContent = `Tienes ${{pending}} notificación(es) pendiente(s) por descargar.`;
+          btn.style.display = 'inline-flex';
+        }} else if (needsCheck) {{
+          box.classList.remove('pending');
+          box.classList.add('check');
+          title.textContent = 'Revisión recomendada';
+          if (typeof minutesSinceSync === 'number') {{
+            text.textContent = `La última sincronización fue hace ${{minutesSinceSync}} min. Presiona "Actualizar" para verificar si hay nuevas notificaciones en SNE.`;
+          }} else {{
+            text.textContent = 'No hay historial local de sincronización. Presiona "Actualizar" para verificar nuevas notificaciones en SNE.';
+          }}
+          btn.style.display = 'inline-flex';
+        }} else {{
+          box.classList.remove('pending');
+          title.textContent = 'Todo al día';
+          text.textContent = 'No hay pendientes por descargar en este momento.';
+          btn.style.display = 'none';
+        }}
+      }} catch (e) {{
+        box.classList.add('show');
+        box.classList.remove('pending');
+        box.classList.remove('check');
+        title.textContent = 'Estado';
+        text.textContent = 'No se pudo verificar pendientes ahora.';
+        btn.style.display = 'none';
+      }}
+    }}
+
+    refreshFloatingAlert();
+    setInterval(refreshFloatingAlert, 20000);
 
     async function toggleDocs(btn, numero, rowId) {{
       const row = document.getElementById(`docs-row-${{rowId}}`);
@@ -419,15 +632,27 @@ def estado():
         "running": UPDATE_STATE["running"],
         "progress": UPDATE_STATE["progress"],
         "error": UPDATE_STATE["error"],
-      "message": UPDATE_STATE["message"],
+        "message": UPDATE_STATE["message"],
+    })
+
+
+@app.get("/api/pending")
+def pending_status():
+    pending = _get_pending_notifications()
+    needs_remote_check, minutes_since_last_sync = _remote_check_required()
+    return JSONResponse({
+        "pending_count": len(pending),
+        "pending_notifications": pending,
+        "needs_remote_check": needs_remote_check,
+        "minutes_since_last_sync": minutes_since_last_sync,
+        "stale_after_minutes": REMOTE_CHECK_STALE_MINUTES,
     })
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(
-    q: str = Query(default="", description="Texto para buscar"),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=PAGE_SIZE_DEFAULT, ge=1, le=500),
+  q: str = Query(default="", description="Texto para buscar"),
+  page: int = Query(default=1, ge=1),
 ) -> HTMLResponse:
     if not DB_PATH.exists():
         return _html_page(
@@ -466,36 +691,43 @@ def index(
             params.extend([f"%{q.strip()}%"] * len(columns))
 
         total = int(con.execute(f"SELECT COUNT(*) FROM notificaciones{where_clause}", params).fetchone()[0])
+        page_size = PAGE_SIZE_FIXED
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
         offset = (page - 1) * page_size
         query = f"SELECT rowid, * FROM notificaciones{where_clause} ORDER BY rowid DESC LIMIT ? OFFSET ?"
         rows = con.execute(query, params + [page_size, offset]).fetchall()
 
     notif_col = _find_notification_column(columns)
+    due_col = _find_due_date_column(columns)
+    asunto_col = next((c for c in columns if c.lower() == "asunto"), None)
 
-    db_notifs: set[str] = set()
-    if notif_col:
-        for row in rows:
-            raw = str(row[notif_col] or "").strip()
-            if raw:
-                db_notifs.add(raw)
-
-        # Usa conteo real de toda la tabla para alerta global, no solo pagina actual.
-        with _connect() as con2:
-            q_pending = f'SELECT DISTINCT "{notif_col}" FROM notificaciones WHERE "{notif_col}" IS NOT NULL AND TRIM("{notif_col}") <> ""'
-            db_notifs = {str(r[0]).strip() for r in con2.execute(q_pending).fetchall() if str(r[0] or "").strip()}
-
-    downloaded_notifs = _notifications_with_files(DOWNLOADS_DIR)
-    pending_notifs = sorted(n for n in db_notifs if n not in downloaded_notifs)
+    pending_notifs = _get_pending_notifications()
     pending_count = len(pending_notifs)
+    needs_remote_check, minutes_since_last_sync = _remote_check_required()
 
     display_cols = [c for c in columns if c.lower() in [dc.lower() for dc in COLUMNS_TO_DISPLAY]]
-    head = "".join(f"<th>{html.escape(c)}</th>" for c in display_cols) + "<th>Documentos</th>"
+    head = "".join(f"<th>{html.escape(c)}</th>" for c in display_cols)
+    head += "<th>Fecha de vencimiento</th><th>Tipo de documento</th><th>Documentos</th>"
     body_rows: list[str] = []
     for row in rows:
         tds = []
         for c in display_cols:
             val = str(row[c] if row[c] is not None else "")
             tds.append(f"<td>{html.escape(val[:50])}</td>" if len(val) > 50 else f"<td>{html.escape(val)}</td>")
+
+        due_value = ""
+        if due_col and row[due_col] is not None:
+          due_value = str(row[due_col]).strip()
+        tds.append(f"<td>{html.escape(due_value) if due_value else '-'}</td>")
+
+        source_text = ""
+        if asunto_col and row[asunto_col] is not None:
+          source_text = str(row[asunto_col])
+        elif notif_col and row[notif_col] is not None:
+          source_text = str(row[notif_col])
+        doc_type = _infer_document_type(source_text)
+        tds.append(f"<td>{html.escape(doc_type)}</td>")
 
         notif = str(row[notif_col]) if notif_col and row[notif_col] else ""
         row_id = int(row["rowid"])
@@ -516,7 +748,10 @@ def index(
         )
 
     prev_page = max(1, page - 1)
-    next_page = page + 1
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    next_page = min(total_pages, page + 1)
+    start_row = (page - 1) * page_size + 1 if total > 0 else 0
+    end_row = min(page * page_size, total)
 
     body = f"""
 <div class="card">
@@ -530,19 +765,27 @@ def index(
   <div class="content">
     <form class="toolbar" method="get" action="/">
       <input type="text" name="q" value="{html.escape(q)}" placeholder="🔍 Buscar en cualquier columna..." />
-      <input type="hidden" name="page_size" value="{page_size}" />
       <button type="submit">Buscar</button>
       <a class="btn secondary" href="/">Limpiar</a>
     </form>
+    <div class="kpi-row">
+      <div class="kpi"><div class="k-label">Total Registros</div><div class="k-value">{total}</div></div>
+      <div class="kpi"><div class="k-label">Página Actual</div><div class="k-value">{page}/{total_pages}</div></div>
+      <div class="kpi"><div class="k-label">Bloque</div><div class="k-value">{start_row}-{end_row}</div></div>
+      <div class="kpi"><div class="k-label">Tamaño Página</div><div class="k-value">10</div></div>
+    </div>
     <div class="info-box">
-      📄 Página {page} de {(total + page_size - 1) // page_size} | Total: {total} registros
+      📄 Mostrando {start_row} a {end_row} de {total} registros (siempre 10 por página).
     </div>
-    <div class="info-box" style="border-left-color: {'#e67e22' if pending_count > 0 else '#27ae60'}; background: {'#fff6e8' if pending_count > 0 else '#edf9f1'}; color: {'#9a5b00' if pending_count > 0 else '#1d7d46'};">
-      {'⚠️ Hay ' + str(pending_count) + ' notificación(es) pendiente(s) por descargar. Presiona "Actualizar".' if pending_count > 0 else '✅ No hay pendientes por descargar en este momento.'}
+    <div class="info-box" style="border-left-color: {'#e67e22' if (pending_count > 0 or needs_remote_check) else '#27ae60'}; background: {'#fff6e8' if (pending_count > 0 or needs_remote_check) else '#edf9f1'}; color: {'#9a5b00' if (pending_count > 0 or needs_remote_check) else '#1d7d46'};">
+      {'⚠️ Hay ' + str(pending_count) + ' notificación(es) pendiente(s) por descargar. Presiona "Actualizar".' if pending_count > 0 else ('⚠️ La última sincronización local está desactualizada' + (' (hace ' + str(minutes_since_last_sync) + ' min)' if minutes_since_last_sync is not None else '') + '. Presiona "Actualizar" para verificar nuevas notificaciones en SNE.' if needs_remote_check else '✅ No hay pendientes por descargar en este momento.')}
     </div>
-    <div class="toolbar">
-      <a class="btn secondary" href="/?q={quote(q)}&page={prev_page}&page_size={page_size}">← Anterior</a>
-      <a class="btn secondary" href="/?q={quote(q)}&page={next_page}&page_size={page_size}">Siguiente →</a>
+    <div class="pager">
+      <div class="pager-group">
+        <a class="btn secondary {'disabled' if page <= 1 else ''}" href="/?q={quote(q)}&page={prev_page}">← Anterior</a>
+        <a class="btn secondary {'disabled' if page >= total_pages else ''}" href="/?q={quote(q)}&page={next_page}">Siguiente →</a>
+      </div>
+      <span class="page-chip">Página {page} de {total_pages}</span>
     </div>
     <div class="table-wrap">
       <table>

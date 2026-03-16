@@ -5,6 +5,7 @@ import csv
 import logging
 import os
 import re
+import sqlite3
 import time
 import unicodedata
 from datetime import datetime
@@ -961,11 +962,115 @@ def _move_download_to_notification_folder(file_path: Path, base_download_dir: Pa
     return target_path
 
 
+def _save_excel_to_sqlite(excel_path: Path, db_path: Path) -> int:
+    """Lee el Excel exportado y guarda/actualiza todas las filas en SQLite.
+    Retorna la cantidad de filas insertadas o actualizadas."""
+    try:
+        import openpyxl  # type: ignore[import-not-found]
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        ws = wb.active
+
+        rows_iter = ws.iter_rows(values_only=True)
+        raw_headers = next(rows_iter, None)
+        if raw_headers is None:
+            wb.close()
+            logging.warning("Excel vacio, no se guardo nada en SQLite.")
+            return 0
+
+        # Normaliza cabeceras para usar como columnas SQL
+        def _col_name(h: object, idx: int) -> str:
+            s = re.sub(r"[^\w]", "_", unicodedata.normalize("NFD", str(h or f"col_{idx}"))
+                       .encode("ascii", "ignore").decode())
+            return (s.strip("_") or f"col_{idx}").lower()
+
+        col_names = [_col_name(h, i) for i, h in enumerate(raw_headers)]
+        # Elimina columnas duplicadas o vacias
+        seen_cols: set[str] = set()
+        final_cols: list[str] = []
+        for c in col_names:
+            base = c or "col"
+            name = base
+            n = 1
+            while name in seen_cols:
+                name = f"{base}_{n}"
+                n += 1
+            seen_cols.add(name)
+            final_cols.append(name)
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        con = sqlite3.connect(str(db_path))
+        cur = con.cursor()
+
+        col_defs = ", ".join(f'"{c}" TEXT' for c in final_cols)
+        cur.execute(f'CREATE TABLE IF NOT EXISTS notificaciones ({col_defs})')
+
+        # Agrega columnas nuevas si la tabla ya existia con menos columnas
+        existing_cols = {row[1].lower() for row in cur.execute('PRAGMA table_info(notificaciones)')}
+        for c in final_cols:
+            if c.lower() not in existing_cols:
+                cur.execute(f'ALTER TABLE notificaciones ADD COLUMN "{c}" TEXT')
+
+        # Columna de fecha de importacion
+        if "fecha_importacion" not in existing_cols:
+            try:
+                cur.execute('ALTER TABLE notificaciones ADD COLUMN "fecha_importacion" TEXT')
+            except sqlite3.OperationalError:
+                pass
+
+        placeholders = ", ".join("?" for _ in final_cols)
+        col_list = ", ".join(f'"{c}"' for c in final_cols)
+        insert_sql = f'INSERT INTO notificaciones ({col_list}, "fecha_importacion") VALUES ({placeholders}, ?)'
+
+        # Detecta columna nro_notificacion para upsert
+        nro_col_idx: int | None = None
+        for i, c in enumerate(final_cols):
+            if "notif" in c:
+                nro_col_idx = i
+                break
+
+        fecha_importacion = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        count = 0
+        for data_row in rows_iter:
+            values = [str(v).strip() if v is not None else "" for v in data_row[:len(final_cols)]]
+            # Padding si la fila tiene menos columnas
+            while len(values) < len(final_cols):
+                values.append("")
+
+            if nro_col_idx is not None:
+                nro = values[nro_col_idx]
+                if nro:
+                    # Actualiza si ya existe, inserta si no
+                    existing = cur.execute(
+                        f'SELECT rowid FROM notificaciones WHERE "{final_cols[nro_col_idx]}" = ?',
+                        (nro,),
+                    ).fetchone()
+                    if existing:
+                        set_clause = ", ".join(f'"{c}" = ?' for c in final_cols)
+                        cur.execute(
+                            f'UPDATE notificaciones SET {set_clause}, "fecha_importacion" = ? WHERE rowid = ?',
+                            values + [fecha_importacion, existing[0]],
+                        )
+                        count += 1
+                        continue
+
+            cur.execute(insert_sql, values + [fecha_importacion])
+            count += 1
+
+        con.commit()
+        con.close()
+        wb.close()
+        logging.info("SQLite actualizado (%s): %s filas guardadas en tabla 'notificaciones'.", db_path.name, count)
+        return count
+    except Exception as exc:
+        logging.warning("Error guardando Excel en SQLite: %s", exc)
+        return 0
+
+
 def _get_notification_numbers_from_excel(excel_path: Path) -> list[str]:
     """Lee todos los Nro. Notificacion desde el Excel exportado (primera columna)."""
     try:
         import openpyxl  # type: ignore[import-not-found]
-        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
         ws = wb.active
         numbers: list[str] = []
         nro_col: int | None = None
@@ -1510,6 +1615,10 @@ sel.value = val;
         return False
 
     logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
+
+    # Guarda todas las filas del Excel en SQLite
+    db_path = download_dir / "notificaciones.db"
+    _save_excel_to_sqlite(downloaded_file, db_path)
 
     # Usa el Excel como fuente de verdad: contiene TODOS los Nro. Notificacion
     # independientemente de la paginacion del grid.

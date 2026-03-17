@@ -38,7 +38,13 @@ def _load_dotenv(dotenv_path: Path) -> None:
     key, value = line.split("=", 1)
     key = key.strip()
     value = value.strip()
-    if key and key not in os.environ:
+    if not key:
+      continue
+
+    # Las variables del proyecto deben tomar prioridad frente al entorno del sistema.
+    if key.startswith("OSI_"):
+      os.environ[key] = value
+    elif key not in os.environ:
       os.environ[key] = value
 
 
@@ -2009,6 +2015,64 @@ def documentos(numero: str, date: str = Query(default="", description="Fecha obj
 </div>
 """
     return _html_page(f"Documentos {numero}", body)
+
+
+def _days_until_deadline(deadline_str: str | None) -> int | None:
+    """Calcula días hasta la fecha de vencimiento."""
+    if not deadline_str:
+        return None
+    try:
+        deadline = datetime.strptime(str(deadline_str), "%Y-%m-%d").date()
+        today = datetime.now().date()
+        delta = (deadline - today).days
+        return delta
+    except Exception:
+        return None
+
+
+@app.get("/api/todos-documentos")
+def todos_documentos_api(limit: int = Query(default=200, description="Max documentos a retornar (1-1000)")):
+    """Devuelve TODOS los documentos de todas las fechas para Power Apps."""
+    limit = max(1, min(1000, limit))
+
+    if not DB_PATH.exists():
+        return JSONResponse({"documentos": [], "total": 0, "db_path": str(DB_PATH)})
+
+    try:
+        with _connect() as con:
+            rows = con.execute(
+                "SELECT nro__notificacion, asunto, fecha_de_notificacion, fecha_importacion, "
+                "processing_date FROM notificaciones "
+                "ORDER BY processing_date DESC, rowid DESC LIMIT ?"
+            , (limit,)).fetchall()
+
+            documentos = []
+            for row in rows:
+                nro = str(row[0] or "")
+                doc = {
+                    "numero": nro,
+                    "numero_normalizado": _normalize_notification_number(nro),
+                    "asunto": str(row[1] or ""),
+                    "fecha_notificacion": str(row[2] or ""),
+                    "fecha_importacion": str(row[3] or ""),
+                    "fecha_procesamiento": str(row[4] or ""),
+                    "url_documentos": f"/api/notificaciones/{nro}/documentos?date={row[4]}" if row[4] else None,
+                    "url_descargar": f"/files/{row[4]}/{nro}/" if row[4] else None,
+                }
+                documentos.append(doc)
+
+            return JSONResponse({
+                "documentos": documentos,
+                "total": len(documentos),
+                "db_path": str(DB_PATH),
+                "descargas_path": str(DOWNLOADS_DIR)
+            })
+    except Exception as e:
+        return JSONResponse({
+            "documentos": [],
+            "total": 0,
+            "error": str(e)
+        }, status_code=500)
 
 
 @app.get("/api/notificaciones/{numero}/documentos")

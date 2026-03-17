@@ -152,7 +152,13 @@ def _load_dotenv(dotenv_path: str = ".env") -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        if key and os.getenv(key) is None:
+        if not key:
+            continue
+
+        # Las variables OSI_* del proyecto deben sobrescribir valores heredados del sistema.
+        if key.startswith("OSI_"):
+            os.environ[key] = value
+        elif os.getenv(key) is None:
             os.environ[key] = value
 
 
@@ -1183,24 +1189,55 @@ def _get_notifications_with_downloads(base_download_dir: Path, processing_date: 
     return existing
 
 
-def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path, processing_date: str) -> Path:
-    """Deja un Excel de exportacion con nombre de la fecha actual y elimina copias (1), (2), ..."""
-    canonical = download_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
+def _resolve_sqlite_path(base_download_dir: Path) -> Path:
+    """Devuelve la ruta de SQLite (env: OSI_SQLITE_PATH) o fallback en downloads."""
+    raw = (os.getenv("OSI_SQLITE_PATH") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (base_download_dir / "notificaciones.db").resolve()
 
+
+def _move_file_with_retries(source: Path, target: Path, retries: int = 10, delay_seconds: float = 0.35) -> Path:
+    """Mueve archivo con reintentos para tolerar bloqueos transitorios de OneDrive/antivirus."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(max(1, retries)):
+        try:
+            if target.exists():
+                target.unlink()
+            source.replace(target)
+            return target
+        except Exception:
+            time.sleep(delay_seconds)
+    return source
+
+
+def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path, processing_date: str) -> Path:
+    """Normaliza exportaciones Excel para que siempre queden dentro de la carpeta por fecha."""
+    day_dir = download_dir / processing_date
+    day_dir.mkdir(parents=True, exist_ok=True)
+    canonical = day_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
+
+    # 1) El archivo detectado en este ciclo debe quedar con nombre diario canonico.
     try:
-        if downloaded_file.resolve() != canonical.resolve():
-            if canonical.exists():
-                try:
-                    canonical.unlink()
-                except Exception:
-                    pass
-            try:
-                downloaded_file.replace(canonical)
-                downloaded_file = canonical
-            except Exception:
-                pass
+        if downloaded_file.exists():
+            downloaded_file = _move_file_with_retries(downloaded_file, canonical)
     except Exception:
-        pass
+        downloaded_file = canonical if canonical.exists() else downloaded_file
+
+    # 2) Limpieza defensiva: mueve cualquier Excel suelto en la raiz de downloads.
+    dated_pattern = re.compile(r"^Notificaciones Electr[oó]nicas - (\d{4}-\d{2}-\d{2})\.xlsx$", re.IGNORECASE)
+    generic_pattern = re.compile(r"^Notificaciones Electr[oó]nicas(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
+    for candidate in download_dir.glob("*.xlsx"):
+        name = candidate.name
+        match = dated_pattern.fullmatch(name)
+        if match:
+            token = match.group(1)
+            target = download_dir / token / f"Notificaciones Electrónicas - {token}.xlsx"
+            _move_file_with_retries(candidate, target)
+            continue
+
+        if generic_pattern.fullmatch(name):
+            _move_file_with_retries(candidate, canonical)
 
     dup_pattern = re.compile(r"^Notificaciones Electr[oó]nicas \(\d+\)\.xlsx$", re.IGNORECASE)
     for candidate in download_dir.glob("*.xlsx"):
@@ -1212,20 +1249,21 @@ def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path, pr
         except Exception:
             pass
 
-    return downloaded_file
+    return canonical if canonical.exists() else downloaded_file
 
 
 def _create_empty_daily_excel(download_dir: Path, processing_date: str) -> Path:
     """Crea un Excel diario vacio para marcar que no hubo datos ese dia."""
-    download_dir.mkdir(parents=True, exist_ok=True)
+    day_dir = download_dir / processing_date
+    day_dir.mkdir(parents=True, exist_ok=True)
 
     if Workbook is None:
-        output_path = download_dir / f"Notificaciones Electrónicas - {processing_date}.csv"
+        output_path = day_dir / f"Notificaciones Electrónicas - {processing_date}.csv"
         if not output_path.exists():
             output_path.write_text("", encoding="utf-8")
         return output_path
 
-    output_path = download_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
+    output_path = day_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
     wb = Workbook()
     ws = wb.active
     ws.title = "Notificaciones"
@@ -1971,7 +2009,7 @@ sel.value = val;
     if not rows:
         empty_file = _create_empty_daily_excel(download_dir, processing_date)
         removed = _cleanup_day_notification_folders(download_dir, processing_date)
-        _clear_processing_date_rows(download_dir / "notificaciones.db", processing_date)
+        _clear_processing_date_rows(_resolve_sqlite_path(download_dir), processing_date)
         logging.info(
             "Sin resultados en la busqueda. Archivo diario vacio: %s. Carpetas del dia limpiadas: %s",
             empty_file.name,
@@ -2004,7 +2042,7 @@ sel.value = val;
     if "no hay datos para exportar" in (alert_text or "").lower():
         empty_file = _create_empty_daily_excel(download_dir, processing_date)
         removed = _cleanup_day_notification_folders(download_dir, processing_date)
-        _clear_processing_date_rows(download_dir / "notificaciones.db", processing_date)
+        _clear_processing_date_rows(_resolve_sqlite_path(download_dir), processing_date)
         logging.info(
             "La plataforma reporto que no hay datos para exportar. Archivo diario vacio: %s. Carpetas del dia limpiadas: %s",
             empty_file.name,
@@ -2022,7 +2060,7 @@ sel.value = val;
     logging.info("Exportacion a Excel completada. Archivo descargado: %s", downloaded_file.name)
 
     # Guarda todas las filas del Excel en SQLite (aislado por fecha de procesamiento).
-    db_path = download_dir / "notificaciones.db"
+    db_path = _resolve_sqlite_path(download_dir)
     _save_excel_to_sqlite(downloaded_file, db_path, processing_date)
 
     # Usa el Excel como fuente de verdad: contiene TODOS los Nro. Notificacion

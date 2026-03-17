@@ -56,12 +56,34 @@ if not DB_PATH.is_absolute():
 
 PAGE_SIZE_FIXED = 10
 REMOTE_CHECK_STALE_MINUTES = int(os.getenv("OSI_REMOTE_CHECK_STALE_MINUTES", "10"))
+AUTO_SYNC_INTERVAL_MINUTES = int(os.getenv("OSI_AUTO_SYNC_INTERVAL_MINUTES", "15"))
 COLUMNS_TO_DISPLAY = [
     "nro__notificacion",
     "asunto",
     "fecha_de_notificacion",
     "fecha_importacion",
 ]
+
+
+def _normalize_target_date(raw: str | None) -> str:
+  token = (raw or "").strip()
+  if not token:
+    return datetime.now().strftime("%Y-%m-%d")
+
+  for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+    try:
+      return datetime.strptime(token, fmt).strftime("%Y-%m-%d")
+    except ValueError:
+      continue
+
+  return datetime.now().strftime("%Y-%m-%d")
+
+
+def _target_date_to_ddmmyyyy(target_date: str) -> str:
+  try:
+    return datetime.strptime(target_date, "%Y-%m-%d").strftime("%d/%m/%Y")
+  except ValueError:
+    return datetime.now().strftime("%d/%m/%Y")
 
 UPDATE_STATE = {
   "running": False,
@@ -73,12 +95,26 @@ UPDATE_STATE = {
 }
 
 
-def _run_update():
-  """Ejecuta osinergmin_auth.py en thread separado."""
+def _auto_sync_loop() -> None:
+  """Limpia el cache periodicamente para reflejar datos nuevos escritos por el daemon."""
+  interval_seconds = max(60, AUTO_SYNC_INTERVAL_MINUTES * 60)
+  while True:
+    time.sleep(interval_seconds)
+    try:
+      _build_notification_files_metadata.cache_clear()
+    except Exception:
+      pass
+
+
+def _run_update(target_date: str | None = None):
+  """Ejecuta osinergmin_auth.py para una fecha exacta (sin mezclar dias)."""
   try:
+    target_iso = _normalize_target_date(target_date)
+    target_dmy = _target_date_to_ddmmyyyy(target_iso)
+
     UPDATE_STATE["running"] = True
     UPDATE_STATE["error"] = None
-    UPDATE_STATE["message"] = "Iniciando actualización incremental..."
+    UPDATE_STATE["message"] = f"Iniciando actualización incremental de {target_iso}..."
     UPDATE_STATE["progress"] = 10
     UPDATE_STATE["started_at"] = time.time()
     UPDATE_STATE["recent_downloads"] = []
@@ -88,6 +124,10 @@ def _run_update():
       [
         str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"),
         str(script_path),
+        "--fecha-notificacion-inicio",
+        target_dmy,
+        "--fecha-notificacion-fin",
+        target_dmy,
         "--incremental-only",
         "--skip-existing-notifications",
       ],
@@ -109,16 +149,16 @@ def _run_update():
     if result.returncode == 0:
       UPDATE_STATE["progress"] = 100
       if "No hay notificaciones nuevas o pendientes por descargar." in combined_output:
-        UPDATE_STATE["message"] = "No hay nada nuevo para descargar."
+        UPDATE_STATE["message"] = f"{target_iso}: no hay nada nuevo para descargar."
       elif "No se descargaron documentos notificados." in combined_output:
-        UPDATE_STATE["message"] = "No hubo documentos nuevos para descargar."
+        UPDATE_STATE["message"] = f"{target_iso}: no hubo documentos nuevos para descargar."
       elif unique_recent_downloads:
-        UPDATE_STATE["message"] = f"Actualización completada. Se descargaron {len(unique_recent_downloads)} documento(s)."
+        UPDATE_STATE["message"] = f"{target_iso}: actualización completada. Se descargaron {len(unique_recent_downloads)} documento(s)."
       else:
-        UPDATE_STATE["message"] = "Actualización completada."
+        UPDATE_STATE["message"] = f"{target_iso}: actualización completada."
     else:
       UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}"
-      UPDATE_STATE["message"] = "La actualización terminó con error."
+      UPDATE_STATE["message"] = f"{target_iso}: la actualización terminó con error."
   except Exception as e:
     UPDATE_STATE["error"] = str(e)
     UPDATE_STATE["progress"] = 0
@@ -131,22 +171,58 @@ def _run_update():
 
 @app.on_event("startup")
 async def _auto_sync_on_startup():
-    """Descarga automáticamente al abrir la app si la carpeta de hoy no existe todavía."""
-    today_folder = DOWNLOADS_DIR / datetime.now().strftime("%Y-%m-%d")
-    if not today_folder.exists() and not UPDATE_STATE["running"]:
-        thread = threading.Thread(target=_run_update, daemon=True)
-        thread.start()
+  """Limpia cache al arranque y lanza el scheduler periodico de refresco de cache."""
+  _build_notification_files_metadata.cache_clear()
+  scheduler = threading.Thread(target=_auto_sync_loop, daemon=True)
+  scheduler.start()
 
 
 def _connect() -> sqlite3.Connection:
     con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
+    _ensure_processing_date_schema(con)
     return con
 
 
 def _get_table_columns(con: sqlite3.Connection) -> list[str]:
     rows = con.execute("PRAGMA table_info(notificaciones)").fetchall()
     return [str(r["name"]) for r in rows]
+
+
+def _ensure_processing_date_schema(con: sqlite3.Connection) -> None:
+    """Garantiza columna processing_date y rellena historial desde fecha_de_notificacion."""
+    try:
+        columns = _get_table_columns(con)
+        lower_map = {c.lower(): c for c in columns}
+
+        if "processing_date" not in lower_map:
+            con.execute('ALTER TABLE notificaciones ADD COLUMN "processing_date" TEXT')
+            con.commit()
+            columns = _get_table_columns(con)
+            lower_map = {c.lower(): c for c in columns}
+
+        notif_date_col = next((c for c in columns if c.lower() in {"fecha_de_notificacion", "fecha_notificacion"}), None)
+        if notif_date_col is None:
+            return
+
+        rows = con.execute(
+            f'SELECT rowid, "{notif_date_col}" AS notif_date, COALESCE(processing_date, "") AS processing_date '
+            f'FROM notificaciones WHERE processing_date IS NULL OR TRIM(processing_date) = ""'
+        ).fetchall()
+
+        updates: list[tuple[str, int]] = []
+        for row in rows:
+            raw_date = str(row["notif_date"] or "").strip()
+            parsed = _parse_notification_date(raw_date)
+            if parsed is None:
+                continue
+            updates.append((parsed.strftime("%Y-%m-%d"), int(row["rowid"])))
+
+        if updates:
+            con.executemany('UPDATE notificaciones SET processing_date = ? WHERE rowid = ?', updates)
+            con.commit()
+    except Exception:
+        return
 
 
 def _find_notification_column(columns: list[str]) -> str | None:
@@ -385,6 +461,22 @@ def _parse_notification_date(value: str) -> datetime | None:
   return None
 
 
+def _normalize_notification_number(value: str) -> str:
+  """Devuelve Nro. Notificacion canonico (NNNN...-N) o vacio si no es valido."""
+  token = (value or "").strip()
+  if not token:
+    return ""
+
+  if re.fullmatch(r"\d{8,}-\d+", token):
+    return token
+
+  embedded = re.search(r"(\d{8,}-\d+)", token)
+  if embedded:
+    return embedded.group(1)
+
+  return ""
+
+
 def _to_datetime(date_text: str) -> datetime | None:
   try:
     return datetime.strptime(date_text, "%d/%m/%Y")
@@ -392,9 +484,15 @@ def _to_datetime(date_text: str) -> datetime | None:
     return None
 
 
-@lru_cache(maxsize=1024)
-def _build_notification_files_metadata(numero: str) -> list[dict[str, str]]:
-  docs = sorted(DOWNLOADS_DIR.glob(f"*/{numero}/*"), key=lambda p: p.name.lower())
+@lru_cache(maxsize=4096)
+def _build_notification_files_metadata(numero: str, target_date: str = "") -> list[dict[str, str]]:
+  normalized_numero = _normalize_notification_number(numero)
+  if not normalized_numero:
+    return []
+
+  normalized_date = _normalize_target_date(target_date) if target_date else ""
+  pattern = f"{normalized_date}/{normalized_numero}/*" if normalized_date else f"*/{normalized_numero}/*"
+  docs = sorted(DOWNLOADS_DIR.glob(pattern), key=lambda p: p.name.lower())
   files: list[dict[str, str]] = []
   for path in docs:
     relative = path.relative_to(DOWNLOADS_DIR).as_posix()
@@ -424,8 +522,13 @@ def _build_notification_files_metadata(numero: str) -> list[dict[str, str]]:
   return files
 
 
-def _summarize_notification_metadata(numero: str, fallback_text: str = "", notification_date_text: str = "") -> tuple[str, str]:
-  files = _build_notification_files_metadata(numero)
+def _summarize_notification_metadata(
+  numero: str,
+  fallback_text: str = "",
+  notification_date_text: str = "",
+  target_date: str = "",
+) -> tuple[str, str]:
+  files = _build_notification_files_metadata(numero, target_date)
   due_dates = [f.get("due_date", "") for f in files if f.get("due_date")]
   parsed = [d for d in (_to_datetime(v) for v in due_dates) if d is not None]
   due_value = min(parsed).strftime("%d/%m/%Y") if parsed else ""
@@ -449,28 +552,36 @@ def _summarize_notification_metadata(numero: str, fallback_text: str = "", notif
   return due_value, doc_type
 
 
-def _notifications_with_files(base_dir: Path) -> set[str]:
+def _notifications_with_files(base_dir: Path, target_date: str = "") -> set[str]:
     out: set[str] = set()
     pat = re.compile(r"\d{8,}-\d+")
     if not base_dir.exists():
         return out
 
-    for folder in base_dir.rglob("*"):
-        if not folder.is_dir() or not pat.fullmatch(folder.name):
+    normalized_date = _normalize_target_date(target_date) if target_date else ""
+    roots = [base_dir / normalized_date] if normalized_date else [base_dir]
+
+    for root in roots:
+        if not root.exists() or not root.is_dir():
             continue
-        try:
-            has_file = any(p.is_file() for p in folder.iterdir())
-        except Exception:
-            has_file = False
-        if has_file:
-            out.add(folder.name)
+        for folder in root.rglob("*"):
+            if not folder.is_dir() or not pat.fullmatch(folder.name):
+                continue
+            try:
+                has_file = any(p.is_file() for p in folder.iterdir())
+            except Exception:
+                has_file = False
+            if has_file:
+                out.add(folder.name)
     return out
 
 
-def _get_pending_notifications() -> list[str]:
-    """Notificaciones en BD que aun no tienen archivos descargados."""
+def _get_pending_notifications(target_date: str = "") -> list[str]:
+    """Notificaciones del dia que aun no tienen archivos descargados."""
     if not DB_PATH.exists():
         return []
+
+    normalized_date = _normalize_target_date(target_date) if target_date else ""
 
     with _connect() as con:
         columns = _get_table_columns(con)
@@ -478,11 +589,88 @@ def _get_pending_notifications() -> list[str]:
         if not notif_col:
             return []
 
-        q = f'SELECT DISTINCT "{notif_col}" FROM notificaciones WHERE "{notif_col}" IS NOT NULL AND TRIM("{notif_col}") <> ""'
-        db_notifs = {str(r[0]).strip() for r in con.execute(q).fetchall() if str(r[0] or "").strip()}
+        where = [f'"{notif_col}" IS NOT NULL', f'TRIM("{notif_col}") <> ""']
+        params: list[str] = []
+        if normalized_date and "processing_date" in {c.lower() for c in columns}:
+            where.append('processing_date = ?')
+            params.append(normalized_date)
 
-    downloaded_notifs = _notifications_with_files(DOWNLOADS_DIR)
+        q = f'SELECT DISTINCT "{notif_col}" FROM notificaciones WHERE ' + " AND ".join(where)
+        db_notifs: set[str] = set()
+        for r in con.execute(q, params).fetchall():
+          raw = str(r[0] or "").strip()
+          normalized = _normalize_notification_number(raw)
+          if normalized:
+            db_notifs.add(normalized)
+
+    downloaded_notifs = _notifications_with_files(DOWNLOADS_DIR, normalized_date)
     return sorted(n for n in db_notifs if n not in downloaded_notifs)
+
+
+def _get_pending_debug_snapshot(target_date: str = "") -> dict[str, object]:
+    """Snapshot de diagnostico para auditar pendientes y formatos de Nro. Notificacion."""
+    normalized_date = _normalize_target_date(target_date) if target_date else ""
+
+    if not DB_PATH.exists():
+        return {
+            "target_date": normalized_date,
+            "db_exists": False,
+            "db_total_notifications": 0,
+            "db_normalized_notifications": 0,
+            "downloaded_notifications": 0,
+            "pending_notifications": [],
+            "malformed_db_values": [],
+            "malformed_count": 0,
+        }
+
+    with _connect() as con:
+        columns = _get_table_columns(con)
+        notif_col = _find_notification_column(columns)
+        if not notif_col:
+            return {
+                "target_date": normalized_date,
+                "db_exists": True,
+                "db_total_notifications": 0,
+                "db_normalized_notifications": 0,
+                "downloaded_notifications": 0,
+                "pending_notifications": [],
+                "malformed_db_values": [],
+                "malformed_count": 0,
+                "error": "No se encontro columna de notificacion en la tabla.",
+            }
+
+        where = [f'"{notif_col}" IS NOT NULL', f'TRIM("{notif_col}") <> ""']
+        params: list[str] = []
+        if normalized_date and "processing_date" in {c.lower() for c in columns}:
+            where.append("processing_date = ?")
+            params.append(normalized_date)
+
+        query = f'SELECT DISTINCT "{notif_col}" FROM notificaciones WHERE ' + " AND ".join(where)
+        raw_values = [str(r[0] or "").strip() for r in con.execute(query, params).fetchall() if str(r[0] or "").strip()]
+
+    normalized_values: set[str] = set()
+    malformed_values: list[str] = []
+    for raw in raw_values:
+        normalized = _normalize_notification_number(raw)
+        if normalized:
+            normalized_values.add(normalized)
+        else:
+            malformed_values.append(raw)
+
+    downloaded_notifs = _notifications_with_files(DOWNLOADS_DIR, normalized_date)
+    pending = sorted(n for n in normalized_values if n not in downloaded_notifs)
+
+    return {
+        "target_date": normalized_date,
+        "db_exists": True,
+        "db_total_notifications": len(raw_values),
+        "db_normalized_notifications": len(normalized_values),
+        "downloaded_notifications": len(downloaded_notifs),
+        "pending_notifications": pending,
+        "pending_count": len(pending),
+        "malformed_db_values": sorted(malformed_values)[:200],
+        "malformed_count": len(malformed_values),
+    }
 
 
 def _minutes_since_last_sync() -> int | None:
@@ -494,6 +682,58 @@ def _minutes_since_last_sync() -> int | None:
         return int(elapsed_seconds // 60)
     except OSError:
         return None
+def _get_latest_processing_date() -> str:
+  """Devuelve la fecha mas reciente que tiene registros en la BD."""
+  if not DB_PATH.exists():
+    return datetime.now().strftime("%Y-%m-%d")
+  try:
+    with _connect() as con:
+      columns = _get_table_columns(con)
+      if "processing_date" not in {c.lower() for c in columns}:
+        return datetime.now().strftime("%Y-%m-%d")
+      row = con.execute(
+        'SELECT processing_date FROM notificaciones '
+        'WHERE processing_date IS NOT NULL AND TRIM(processing_date) != "" '
+        'ORDER BY processing_date DESC LIMIT 1'
+      ).fetchone()
+      if row and row[0]:
+        return str(row[0]).strip()
+  except Exception:
+    pass
+  return datetime.now().strftime("%Y-%m-%d")
+
+
+def _get_available_dates() -> list[str]:
+  """Lista de fechas con registros en la BD, ordenadas desc."""
+  if not DB_PATH.exists():
+    return []
+  try:
+    with _connect() as con:
+      columns = _get_table_columns(con)
+      if "processing_date" not in {c.lower() for c in columns}:
+        return []
+      rows = con.execute(
+        'SELECT DISTINCT processing_date FROM notificaciones '
+        'WHERE processing_date IS NOT NULL AND TRIM(processing_date) != "" '
+        'ORDER BY processing_date DESC'
+      ).fetchall()
+      return [str(r[0]) for r in rows if r[0]]
+  except Exception:
+    return []
+
+
+def _prev_day(date_iso: str) -> str:
+  try:
+    return (datetime.strptime(date_iso, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+  except Exception:
+    return date_iso
+
+
+def _next_day(date_iso: str) -> str:
+  try:
+    return (datetime.strptime(date_iso, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+  except Exception:
+    return date_iso
 
 
 def _remote_check_required() -> tuple[bool, int | None]:
@@ -912,6 +1152,15 @@ def _html_page(title: str, body: str) -> HTMLResponse:
   <script>
     const bellState = {{ items: [], keys: new Set(), pendingCount: 0 }};
 
+    function getTargetDate() {{
+      const holder = document.getElementById('osiDateContext');
+      if (holder && holder.dataset && holder.dataset.targetDate) return holder.dataset.targetDate;
+      const now = new Date();
+      const mm = String(now.getMonth() + 1).padStart(2, '0');
+      const dd = String(now.getDate()).padStart(2, '0');
+      return `${{now.getFullYear()}}-${{mm}}-${{dd}}`;
+    }}
+
     function nowLabel() {{
       const d = new Date();
       return d.toLocaleTimeString('es-PE', {{ hour: '2-digit', minute: '2-digit' }});
@@ -981,7 +1230,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       modal.classList.add('active');
       
       try {{
-        const resp = await fetch('/api/actualizar', {{ method: 'POST' }});
+        const resp = await fetch(`/api/actualizar?date=${{encodeURIComponent(getTargetDate())}}`, {{ method: 'POST' }});
         const data = await resp.json();
         
         if(data.success) {{
@@ -1030,7 +1279,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       if (!box || !title || !text || !btn) return;
 
       try {{
-        const res = await fetch('/api/pending');
+        const res = await fetch(`/api/pending?date=${{encodeURIComponent(getTargetDate())}}`);
         const data = await res.json();
         const pending = Number(data.pending_count || 0);
         const needsCheck = Boolean(data.needs_remote_check);
@@ -1090,6 +1339,31 @@ def _html_page(title: str, body: str) -> HTMLResponse:
     refreshFloatingAlert();
     setInterval(refreshFloatingAlert, 20000);
 
+    // Carga las fechas disponibles para el selector de navegacion.
+    (async function loadAvailableDates() {{
+      try {{
+        const data = await fetch('/api/fechas').then(r => r.json());
+        const wrap = document.getElementById('availDatesWrap');
+        if (!wrap) return;
+        const fechas = data.fechas || [];
+        if (fechas.length === 0) {{
+          wrap.textContent = 'Sin fechas en BD';
+          return;
+        }}
+        const currentDate = getTargetDate();
+        const options = fechas.map((f) => {{
+          const selected = f === currentDate ? ' selected' : '';
+          const d = new Date(f + 'T00:00:00');
+          const label = d.toLocaleDateString('es-PE', {{ day: '2-digit', month: '2-digit', year: 'numeric' }});
+          return `<option value="${{f}}"${{selected}}>${{label}}</option>`;
+        }}).join('');
+        wrap.innerHTML = `<label style="font-size:12px;color:#607188;">Fechas disponibles:&nbsp;<select onchange="location.href='/?date='+this.value" style="font-size:12px;border-radius:6px;border:1px solid #d3dfec;padding:4px 8px;">${{options}}</select></label>`;
+      }} catch (e) {{
+        const wrap = document.getElementById('availDatesWrap');
+        if (wrap) wrap.textContent = '';
+      }}
+    }})();
+
     async function abrirEstadisticas() {{
       const modal = document.getElementById('statsModal');
       const body = document.getElementById('statsBody');
@@ -1098,7 +1372,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       totalEl.textContent = '';
       modal.classList.add('active');
       try {{
-        const data = await fetch('/api/estadisticas').then(r => r.json());
+        const data = await fetch(`/api/estadisticas?date=${{encodeURIComponent(getTargetDate())}}`).then(r => r.json());
         const items = data.tipos || [];
         const total = data.total || 0;
         if (items.length === 0) {{
@@ -1125,7 +1399,7 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       document.getElementById('statsModal').classList.remove('active');
     }}
 
-    async function toggleDocs(btn, numero, rowId) {{
+    async function toggleDocs(btn, numero, rowId, targetDate) {{
       const row = document.getElementById(`docs-row-${{rowId}}`);
       const body = document.getElementById(`docs-body-${{rowId}}`);
       if (!row || !body) return;
@@ -1143,7 +1417,8 @@ def _html_page(title: str, body: str) -> HTMLResponse:
       body.innerHTML = '<div class="docs-empty">Cargando documentos...</div>';
 
       try {{
-        const resp = await fetch(`/api/notificaciones/${{encodeURIComponent(numero)}}/documentos`);
+        const dateParam = targetDate || getTargetDate();
+        const resp = await fetch(`/api/notificaciones/${{encodeURIComponent(numero)}}/documentos?date=${{encodeURIComponent(dateParam)}}`);
         const data = await resp.json();
         if (!data || !Array.isArray(data.files) || data.files.length === 0) {{
           body.innerHTML = '<div class="docs-empty">No hay documentos para esta notificación.</div>';
@@ -1176,17 +1451,25 @@ def health() -> dict[str, str]:
     }
 
 
+@app.get("/api/fechas")
+def fechas_disponibles():
+  """Lista de fechas con datos en la BD, para navegacion en el visor."""
+  dates = _get_available_dates()
+  return JSONResponse({"fechas": dates, "latest": dates[0] if dates else ""})
+
+
 @app.post("/api/actualizar")
-def actualizar():
-    """Inicia la actualización en background."""
+def actualizar(date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy")):
+    """Inicia la actualización en background para una fecha exacta."""
     if UPDATE_STATE["running"]:
         return JSONResponse({"success": False, "error": "Ya se está ejecutando una actualización"}, status_code=400)
 
+    target_date = _normalize_target_date(date)
     UPDATE_STATE["progress"] = 5
     UPDATE_STATE["started_at"] = time.time()
-    thread = threading.Thread(target=_run_update, daemon=True)
+    thread = threading.Thread(target=_run_update, args=(target_date,), daemon=True)
     thread.start()
-    return JSONResponse({"success": True, "message": "Actualización iniciada"})
+    return JSONResponse({"success": True, "message": f"Actualización iniciada para {target_date}"})
 
 
 @app.get("/api/estado")
@@ -1216,10 +1499,12 @@ def estado():
 
 
 @app.get("/api/pending")
-def pending_status():
-    pending = _get_pending_notifications()
+def pending_status(date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy")):
+    target_date = _normalize_target_date(date)
+    pending = _get_pending_notifications(target_date)
     needs_remote_check, minutes_since_last_sync = _remote_check_required()
     return JSONResponse({
+        "target_date": target_date,
         "pending_count": len(pending),
         "pending_notifications": pending,
         "needs_remote_check": needs_remote_check,
@@ -1228,19 +1513,35 @@ def pending_status():
     })
 
 
+@app.get("/api/debug/pending")
+def pending_debug(date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy")):
+    """Diagnostico de solo lectura para auditar pendientes y formatos invalidos en BD."""
+    snapshot = _get_pending_debug_snapshot(date)
+    return JSONResponse(snapshot)
+
+
 @app.get("/api/estadisticas")
-def estadisticas():
+def estadisticas(date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy")):
   """Retorna conteo de notificaciones por tipo de documento inferido."""
+  target_date = _normalize_target_date(date)
   if not DB_PATH.exists():
-    return JSONResponse({"tipos": [], "total": 0})
+    return JSONResponse({"target_date": target_date, "tipos": [], "total": 0})
   try:
     con = _connect()
-    rows = con.execute(
-      "SELECT nro__notificacion, asunto FROM notificaciones WHERE nro__notificacion IS NOT NULL"
-    ).fetchall()
+    columns = _get_table_columns(con)
+    has_processing_date = "processing_date" in {c.lower() for c in columns}
+    if has_processing_date:
+      rows = con.execute(
+        "SELECT nro__notificacion, asunto FROM notificaciones WHERE nro__notificacion IS NOT NULL AND processing_date = ?",
+        (target_date,),
+      ).fetchall()
+    else:
+      rows = con.execute(
+        "SELECT nro__notificacion, asunto FROM notificaciones WHERE nro__notificacion IS NOT NULL"
+      ).fetchall()
     con.close()
   except Exception:
-    return JSONResponse({"tipos": [], "total": 0})
+    return JSONResponse({"target_date": target_date, "tipos": [], "total": 0})
 
   counts: Counter = Counter()
   seen: set[str] = set()
@@ -1250,8 +1551,7 @@ def estadisticas():
       continue
     seen.add(nro)
     asunto = str(row["asunto"] or "").strip()
-    # Try to get doc type from downloaded files first, fall back to asunto
-    files = _build_notification_files_metadata(nro)
+    files = _build_notification_files_metadata(nro, target_date)
     if files:
       tipo = files[0].get("document_type") or _infer_document_type(asunto)
     else:
@@ -1262,14 +1562,17 @@ def estadisticas():
     [{"tipo": t, "count": c} for t, c in counts.items()],
     key=lambda x: -x["count"],
   )
-  return JSONResponse({"tipos": tipos, "total": len(seen)})
+  return JSONResponse({"target_date": target_date, "tipos": tipos, "total": len(seen)})
 
 
 @app.get("/", response_class=HTMLResponse)
 def index(
   q: str = Query(default="", description="Texto para buscar"),
   page: int = Query(default=1, ge=1),
+  date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy"),
 ) -> HTMLResponse:
+    # Si no se especifica fecha, usar la mas reciente con datos en la BD.
+    target_date = _normalize_target_date(date) if date.strip() else _get_latest_processing_date()
     head_actions = _head_actions_html()
 
     if not DB_PATH.exists():
@@ -1301,12 +1604,20 @@ def index(
 """,
             )
 
-        where_clause = ""
+        has_processing_date = "processing_date" in {c.lower() for c in columns}
+        filters: list[str] = []
         params: list[str | int] = []
+
+        if has_processing_date:
+            filters.append("processing_date = ?")
+            params.append(target_date)
+
         if q.strip():
             where_parts = [f'CAST("{c}" AS TEXT) LIKE ?' for c in columns]
-            where_clause = " WHERE " + " OR ".join(where_parts)
+            filters.append("(" + " OR ".join(where_parts) + ")")
             params.extend([f"%{q.strip()}%"] * len(columns))
+
+        where_clause = (" WHERE " + " AND ".join(filters)) if filters else ""
 
         total = int(con.execute(f"SELECT COUNT(*) FROM notificaciones{where_clause}", params).fetchone()[0])
         page_size = PAGE_SIZE_FIXED
@@ -1321,7 +1632,7 @@ def index(
     asunto_col = next((c for c in columns if c.lower() == "asunto"), None)
     notif_date_col = next((c for c in columns if c.lower() in ["fecha_de_notificacion", "fecha_notificacion"]), None)
 
-    pending_notifs = _get_pending_notifications()
+    pending_notifs = _get_pending_notifications(target_date)
     pending_count = len(pending_notifs)
     needs_remote_check, minutes_since_last_sync = _remote_check_required()
 
@@ -1341,12 +1652,18 @@ def index(
         elif notif_col and row[notif_col] is not None:
           source_text = str(row[notif_col])
 
-        notif = str(row[notif_col]) if notif_col and row[notif_col] else ""
+        notif_raw = str(row[notif_col]) if notif_col and row[notif_col] else ""
+        notif = _normalize_notification_number(notif_raw)
         due_value = ""
         doc_type = _infer_document_type(source_text)
         notif_date_text = str(row[notif_date_col]) if notif_date_col and row[notif_date_col] is not None else ""
         if notif:
-          due_from_docs, doc_type_from_docs = _summarize_notification_metadata(notif, source_text, notif_date_text)
+          due_from_docs, doc_type_from_docs = _summarize_notification_metadata(
+            notif,
+            source_text,
+            notif_date_text,
+            target_date,
+          )
           if due_from_docs:
             due_value = due_from_docs
           if doc_type_from_docs:
@@ -1362,10 +1679,10 @@ def index(
         if notif:
             docs_link = (
                 f"<button type='button' class='btn secondary' "
-                f"onclick=\"toggleDocs(this, '{html.escape(notif)}', {row_id})\">Ver documentos</button>"
+                f"onclick=\"toggleDocs(this, '{html.escape(notif)}', {row_id}, '{target_date}')\">Ver documentos</button>"
             )
         else:
-            docs_link = "<span class='muted'>Sin Nro.</span>"
+          docs_link = "<span class='muted'>Sin Nro. válido</span>"
         tds.append(f"<td>{docs_link}</td>")
 
         body_rows.append("<tr>" + "".join(tds) + "</tr>")
@@ -1391,11 +1708,19 @@ def index(
     {head_actions}
   </div>
   <div class="content">
+    <div id="osiDateContext" data-target-date="{target_date}" style="display:none;"></div>
     <form class="toolbar" method="get" action="/">
+      <input type="date" name="date" value="{target_date}" style="max-width:170px; flex:0 0 170px;" />
       <input type="text" name="q" value="{html.escape(q)}" placeholder="🔍 Buscar en cualquier columna..." />
       <button type="submit">Buscar</button>
-      <a class="btn secondary" href="/">Limpiar</a>
+      <a class="btn secondary" href="/?date={target_date}">Limpiar</a>
     </form>
+    <div class="date-nav" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;align-items:center;">
+      <a class="btn secondary" id="prevDayBtn" href="/?date={_prev_day(target_date)}" style="padding:8px 12px;font-size:13px;">&#8592; Día anterior</a>
+      <a class="btn secondary" id="nextDayBtn" href="/?date={_next_day(target_date)}" style="padding:8px 12px;font-size:13px;">Día siguiente &#8594;</a>
+      <a class="btn" href="/" style="padding:8px 12px;font-size:13px;background:{'#1f9d55' if target_date == datetime.now().strftime('%Y-%m-%d') else '#607188'};">Hoy ({datetime.now().strftime('%d/%m/%Y')})</a>
+      <span id="availDatesWrap" style="font-size:12px;color:#607188;margin-left:4px;">Cargando fechas...</span>
+    </div>
     <div class="kpi-row">
       <div class="kpi"><div class="k-label">Total Registros</div><div class="k-value">{total}</div></div>
       <div class="kpi"><div class="k-label">Página Actual</div><div class="k-value">{page}/{total_pages}</div></div>
@@ -1403,15 +1728,15 @@ def index(
       <div class="kpi"><div class="k-label">Tamaño Página</div><div class="k-value">10</div></div>
     </div>
     <div class="info-box">
-      📄 Mostrando {start_row} a {end_row} de {total} registros (siempre 10 por página).
+      � Fecha activa: {target_date}. Mostrando {start_row} a {end_row} de {total} registros (siempre 10 por página).
     </div>
     <div class="info-box" style="border-left-color: {'#e67e22' if (pending_count > 0 or needs_remote_check) else '#27ae60'}; background: {'#fff6e8' if (pending_count > 0 or needs_remote_check) else '#edf9f1'}; color: {'#9a5b00' if (pending_count > 0 or needs_remote_check) else '#1d7d46'};">
       {'⚠️ Hay ' + str(pending_count) + ' notificación(es) pendiente(s) por descargar. Presiona "Actualizar".' if pending_count > 0 else ('⚠️ La última sincronización local está desactualizada' + (' (hace ' + str(minutes_since_last_sync) + ' min)' if minutes_since_last_sync is not None else '') + '. Presiona "Actualizar" para verificar nuevas notificaciones en SNE.' if needs_remote_check else '✅ No hay pendientes por descargar en este momento.')}
     </div>
     <div class="pager">
       <div class="pager-group">
-        <a class="btn secondary {'disabled' if page <= 1 else ''}" href="/?q={quote(q)}&page={prev_page}">← Anterior</a>
-        <a class="btn secondary {'disabled' if page >= total_pages else ''}" href="/?q={quote(q)}&page={next_page}">Siguiente →</a>
+        <a class="btn secondary {'disabled' if page <= 1 else ''}" href="/?date={target_date}&q={quote(q)}&page={prev_page}">← Anterior</a>
+        <a class="btn secondary {'disabled' if page >= total_pages else ''}" href="/?date={target_date}&q={quote(q)}&page={next_page}">Siguiente →</a>
       </div>
       <span class="page-chip">Página {page} de {total_pages}</span>
     </div>
@@ -1428,8 +1753,10 @@ def index(
 
 
 @app.get("/notificaciones/{numero}/documentos", response_class=HTMLResponse)
-def documentos(numero: str) -> HTMLResponse:
-    docs = _build_notification_files_metadata(numero)
+def documentos(numero: str, date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy")) -> HTMLResponse:
+    target_date = _normalize_target_date(date)
+    normalized_numero = _normalize_notification_number(numero)
+    docs = _build_notification_files_metadata(normalized_numero, target_date)
 
     if not docs:
         body = f"""
@@ -1467,10 +1794,12 @@ def documentos(numero: str) -> HTMLResponse:
 
 
 @app.get("/api/notificaciones/{numero}/documentos")
-def documentos_api(numero: str):
-    files = _build_notification_files_metadata(numero)
+def documentos_api(numero: str, date: str = Query(default="", description="Fecha objetivo YYYY-MM-DD o dd/mm/yyyy")):
+    target_date = _normalize_target_date(date)
+    normalized_numero = _normalize_notification_number(numero)
+    files = _build_notification_files_metadata(normalized_numero, target_date)
 
-    return JSONResponse({"numero": numero, "files": files})
+    return JSONResponse({"numero": numero, "normalized_numero": normalized_numero, "target_date": target_date, "files": files})
 
 
 @app.get("/files/{file_path:path}")

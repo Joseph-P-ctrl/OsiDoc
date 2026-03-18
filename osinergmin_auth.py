@@ -77,8 +77,8 @@ class AuthConfig:
     download_dir: str = "downloads"
     export_wait_seconds: int = 40
     target_notifications: tuple[str, ...] = ()
-    incremental_only: bool = False
-    skip_existing_notifications: bool = False
+    incremental_only: bool = True
+    skip_existing_notifications: bool = True
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -145,12 +145,13 @@ def _load_dotenv(dotenv_path: str = ".env") -> None:
         return
 
     for raw_line in path.read_text(encoding="utf-8").splitlines():
+        raw_line = raw_line.lstrip("\ufeff")
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
 
         key, value = line.split("=", 1)
-        key = key.strip()
+        key = key.strip().lstrip("\ufeff")
         value = value.strip().strip('"').strip("'")
         if not key:
             continue
@@ -1197,6 +1198,89 @@ def _resolve_sqlite_path(base_download_dir: Path) -> Path:
     return (base_download_dir / "notificaciones.db").resolve()
 
 
+def _resolve_default_download_dir() -> str:
+    """Resuelve carpeta de descargas por defecto priorizando la carpeta sincronizada de SharePoint."""
+    env_value = (os.getenv("OSI_DOWNLOAD_DIR") or "").strip()
+    if env_value:
+        return env_value
+
+    user_profile = Path(os.getenv("USERPROFILE", "")).expanduser()
+    if str(user_profile).strip():
+        # Prioridad 1: carpeta sincronizada directamente con SharePoint via Teams
+        sp_sync = user_profile / "Fonafe" / "CALIDAD-FISCALIZACION-ENSA - Notificaciones Osinergmin"
+        if sp_sync.exists():
+            return str(sp_sync)
+        # Prioridad 2: carpeta OneDrive/OsiDoc (ruta anterior)
+        preferred = user_profile / "OneDrive - Fonafe" / "OsiDoc" / "Documento"
+        if preferred.exists():
+            return str(preferred)
+
+    return "downloads"
+
+
+def _cleanup_empty_legacy_downloads(download_dir: Path) -> None:
+    """Elimina carpeta local ./downloads si quedo vacia tras migracion."""
+    workspace_dir = Path(__file__).resolve().parent
+    legacy_dir = (workspace_dir / "downloads").resolve()
+    target_dir = download_dir.resolve()
+
+    if legacy_dir == target_dir or not legacy_dir.exists() or not legacy_dir.is_dir():
+        return
+
+    for folder in sorted([p for p in legacy_dir.rglob("*") if p.is_dir()], key=lambda p: len(p.parts), reverse=True):
+        try:
+            folder.rmdir()
+        except Exception:
+            continue
+
+    try:
+        legacy_dir.rmdir()
+    except Exception:
+        pass
+
+
+def _migrate_legacy_local_downloads(download_dir: Path) -> int:
+    """Mueve archivos rezagados de ./downloads y de la ruta anterior de OneDrive hacia la ruta configurada."""
+    workspace_dir = Path(__file__).resolve().parent
+    target_dir = download_dir.resolve()
+
+    legacy_sources: list[Path] = []
+
+    # Fuente 1: ./downloads local del proyecto
+    legacy_local = (workspace_dir / "downloads").resolve()
+    if legacy_local != target_dir and legacy_local.exists() and legacy_local.is_dir():
+        legacy_sources.append(legacy_local)
+
+    # Fuente 2: ruta anterior OneDrive/OsiDoc/Documento
+    user_profile = Path(os.getenv("USERPROFILE", "")).expanduser()
+    if str(user_profile).strip():
+        old_onedrive = (user_profile / "OneDrive - Fonafe" / "OsiDoc" / "Documento").resolve()
+        if old_onedrive != target_dir and old_onedrive.exists() and old_onedrive.is_dir():
+            legacy_sources.append(old_onedrive)
+
+    moved = 0
+    for legacy_dir in legacy_sources:
+        for source in legacy_dir.rglob("*"):
+            if not source.is_file():
+                continue
+            if source.name.lower() == "notificaciones.db":
+                continue
+            # Ignorar archivos de metadata de SharePoint/OneDrive
+            if source.name.startswith(".") and len(source.name) > 30:
+                continue
+            try:
+                rel = source.relative_to(legacy_dir)
+                target = target_dir / rel
+                _move_file_with_retries(source, target)
+                moved += 1
+            except Exception:
+                continue
+
+        _cleanup_empty_legacy_downloads(legacy_dir)
+
+    return moved
+
+
 def _move_file_with_retries(source: Path, target: Path, retries: int = 10, delay_seconds: float = 0.35) -> Path:
     """Mueve archivo con reintentos para tolerar bloqueos transitorios de OneDrive/antivirus."""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -1252,6 +1336,68 @@ def _normalize_exported_excel_file(download_dir: Path, downloaded_file: Path, pr
     return canonical if canonical.exists() else downloaded_file
 
 
+def _enforce_daily_excel_layout(download_dir: Path, processing_date: str) -> Path:
+    """Garantiza que el Excel diario quede en carpeta YYYY-MM-DD con nombre canonico."""
+    day_dir = download_dir / processing_date
+    day_dir.mkdir(parents=True, exist_ok=True)
+    canonical = day_dir / f"Notificaciones Electrónicas - {processing_date}.xlsx"
+
+    if canonical.exists():
+        return canonical
+
+    generic_pattern = re.compile(r"^Notificaciones Electr[oó]nicas(?: \(\d+\))?\.xlsx$", re.IGNORECASE)
+    dated_pattern = re.compile(r"^Notificaciones Electr[oó]nicas - (\d{4}-\d{2}-\d{2})\.xlsx$", re.IGNORECASE)
+
+    for candidate in download_dir.glob("*.xlsx"):
+        if not candidate.is_file():
+            continue
+
+        name = candidate.name
+        dated_match = dated_pattern.fullmatch(name)
+        if dated_match:
+            token = dated_match.group(1)
+            target = download_dir / token / f"Notificaciones Electrónicas - {token}.xlsx"
+            _move_file_with_retries(candidate, target)
+            continue
+
+        if generic_pattern.fullmatch(name):
+            _move_file_with_retries(candidate, canonical)
+
+    return canonical
+
+
+def _relocate_stray_root_files(download_dir: Path, processing_date: str) -> int:
+    """Mueve cualquier archivo suelto en la raiz de download_dir a la subcarpeta de fecha.
+    Evita que archivos descargados sin mover aparezcan en la raiz de SharePoint al sincronizar."""
+    if not download_dir.exists():
+        return 0
+
+    excel_pattern = re.compile(r"^Notificaciones Electr[oó]nicas.*\.xlsx$", re.IGNORECASE)
+    dest_dir = download_dir / processing_date / "sin-clasificar"
+    moved = 0
+
+    for candidate in list(download_dir.iterdir()):
+        if candidate.is_dir():
+            continue
+        # Los .db se quedan donde estan (gestionados por OSI_SQLITE_PATH)
+        if candidate.suffix.lower() == ".db":
+            continue
+        # Los Excel se manejan en _enforce_daily_excel_layout
+        if excel_pattern.match(candidate.name):
+            continue
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        target = dest_dir / candidate.name
+        try:
+            _move_file_with_retries(candidate, target)
+            logging.info("Archivo suelto movido a carpeta de fecha: %s → %s", candidate.name, target.relative_to(download_dir))
+            moved += 1
+        except Exception:
+            continue
+
+    return moved
+
+
 def _create_empty_daily_excel(download_dir: Path, processing_date: str) -> Path:
     """Crea un Excel diario vacio para marcar que no hubo datos ese dia."""
     day_dir = download_dir / processing_date
@@ -1269,6 +1415,43 @@ def _create_empty_daily_excel(download_dir: Path, processing_date: str) -> Path:
     ws.title = "Notificaciones"
     wb.save(output_path)
     return output_path
+
+
+def _update_excel_control_sheet(
+    excel_path: Path,
+    processing_date: str,
+    notifications_count: int,
+    docs_downloaded: int,
+) -> None:
+    """Actualiza una hoja de control para dejar trazabilidad del ultimo proceso."""
+    if Workbook is None:
+        return
+
+    if excel_path.suffix.lower() != ".xlsx" or not excel_path.exists():
+        return
+
+    try:
+        import openpyxl  # type: ignore[import-not-found]
+
+        wb = openpyxl.load_workbook(excel_path)
+        if "Control" in wb.sheetnames:
+            ws = wb["Control"]
+            ws.delete_rows(1, ws.max_row)
+        else:
+            ws = wb.create_sheet("Control")
+
+        ws.append(["processing_date", "updated_at", "notificaciones", "documentos_descargados"])
+        ws.append([
+            processing_date,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            int(max(0, notifications_count)),
+            int(max(0, docs_downloaded)),
+        ])
+
+        wb.save(excel_path)
+        wb.close()
+    except Exception as exc:
+        logging.warning("No se pudo actualizar la hoja Control en %s: %s", excel_path.name, exc)
 
 
 def _cleanup_day_notification_folders(base_download_dir: Path, processing_date: str) -> int:
@@ -1863,7 +2046,8 @@ def _apply_sne_filters(driver, cfg: AuthConfig) -> bool:
     """Llena fechas y ejecuta la busqueda en la bandeja del SNE."""
     now = datetime.now()
     today = now.strftime("%d/%m/%Y")
-    default_inicio = f"15/{now.month:02d}/{now.year}"
+    # Por defecto se procesa solo el dia actual para evitar arrastrar historico.
+    default_inicio = today
     fecha_inicio = cfg.fecha_notificacion_inicio or default_inicio
     fecha_fin = cfg.fecha_notificacion_fin or today
     processing_date = _resolve_processing_date(cfg)
@@ -2005,9 +2189,17 @@ sel.value = val;
 
     download_dir = Path(cfg.download_dir).expanduser().resolve()
     download_dir.mkdir(parents=True, exist_ok=True)
+    migrated = _migrate_legacy_local_downloads(download_dir)
+    if migrated > 0:
+        logging.info("Migracion automatica aplicada: %s archivo(s) movido(s) desde ./downloads.", migrated)
+    _enforce_daily_excel_layout(download_dir, processing_date)
+    stray = _relocate_stray_root_files(download_dir, processing_date)
+    if stray > 0:
+        logging.info("Archivos sueltos en raiz movidos a carpeta de fecha: %s archivo(s).", stray)
 
     if not rows:
         empty_file = _create_empty_daily_excel(download_dir, processing_date)
+        _update_excel_control_sheet(empty_file, processing_date, notifications_count=0, docs_downloaded=0)
         removed = _cleanup_day_notification_folders(download_dir, processing_date)
         _clear_processing_date_rows(_resolve_sqlite_path(download_dir), processing_date)
         logging.info(
@@ -2041,6 +2233,7 @@ sel.value = val;
     alert_text = _accept_browser_alert_if_present(driver, expected_text="No hay datos para exportar")
     if "no hay datos para exportar" in (alert_text or "").lower():
         empty_file = _create_empty_daily_excel(download_dir, processing_date)
+        _update_excel_control_sheet(empty_file, processing_date, notifications_count=0, docs_downloaded=0)
         removed = _cleanup_day_notification_folders(download_dir, processing_date)
         _clear_processing_date_rows(_resolve_sqlite_path(download_dir), processing_date)
         logging.info(
@@ -2106,6 +2299,13 @@ sel.value = val;
         logging.info("Descarga de documentos notificados completada. Archivos descargados: %s", docs_downloaded)
     else:
         logging.warning("No se descargaron documentos notificados.")
+
+    _update_excel_control_sheet(
+        downloaded_file,
+        processing_date,
+        notifications_count=len(excel_notification_numbers or []),
+        docs_downloaded=docs_downloaded,
+    )
 
     return True
 
@@ -2800,7 +3000,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--download-dir",
-        default=os.getenv("OSI_DOWNLOAD_DIR", "downloads"),
+        default=_resolve_default_download_dir(),
         help="Carpeta de descargas para exportaciones (env: OSI_DOWNLOAD_DIR)",
     )
     parser.add_argument(
@@ -2817,13 +3017,13 @@ def main() -> None:
     parser.add_argument(
         "--incremental-only",
         action="store_true",
-        default=_env_bool("OSI_INCREMENTAL_ONLY", False),
+        default=_env_bool("OSI_INCREMENTAL_ONLY", True),
         help="Solo procesa notificaciones nuevas o pendientes (env: OSI_INCREMENTAL_ONLY)",
     )
     parser.add_argument(
         "--skip-existing-notifications",
         action="store_true",
-        default=_env_bool("OSI_SKIP_EXISTING_NOTIFICATIONS", False),
+        default=_env_bool("OSI_SKIP_EXISTING_NOTIFICATIONS", True),
         help="No vuelve a descargar notificaciones que ya tienen archivos (env: OSI_SKIP_EXISTING_NOTIFICATIONS)",
     )
     parser.add_argument(

@@ -32,11 +32,12 @@ def _load_dotenv(dotenv_path: Path) -> None:
     return
 
   for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+    raw_line = raw_line.lstrip("\ufeff")
     line = raw_line.strip()
     if not line or line.startswith("#") or "=" not in line:
       continue
     key, value = line.split("=", 1)
-    key = key.strip()
+    key = key.strip().lstrip("\ufeff")
     value = value.strip()
     if not key:
       continue
@@ -138,21 +139,34 @@ def _run_update(target_date: str | None = None):
     UPDATE_STATE["recent_downloads"] = []
 
     script_path = WORKSPACE_DIR / "osinergmin_auth.py"
+    _load_dotenv(WORKSPACE_DIR / ".env")
+    run_env = os.environ.copy()
+
+    cmd = [
+      str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"),
+      str(script_path),
+      "--fecha-notificacion-inicio",
+      target_dmy,
+      "--fecha-notificacion-fin",
+      target_dmy,
+      "--download-dir",
+      str(DOWNLOADS_DIR),
+      "--incremental-only",
+      "--skip-existing-notifications",
+    ]
+
+    user = (run_env.get("OSI_USERNAME") or "").strip()
+    pwd = (run_env.get("OSI_PASSWORD") or "").strip()
+    if user and pwd:
+      cmd.extend(["--username", user, "--password", pwd])
+
     result = subprocess.run(
-      [
-        str(WORKSPACE_DIR / ".venv" / "Scripts" / "python.exe"),
-        str(script_path),
-        "--fecha-notificacion-inicio",
-        target_dmy,
-        "--fecha-notificacion-fin",
-        target_dmy,
-        "--incremental-only",
-        "--skip-existing-notifications",
-      ],
+      cmd,
       cwd=str(WORKSPACE_DIR),
       capture_output=True,
       text=True,
-      timeout=600,
+      timeout=1200,
+      env=run_env,
     )
 
     combined_output = (result.stdout or "") + "\n" + (result.stderr or "")
@@ -164,7 +178,19 @@ def _run_update(target_date: str | None = None):
     unique_recent_downloads = list(dict.fromkeys([m.strip() for m in moved_files if m and m.strip()]))
     UPDATE_STATE["recent_downloads"] = unique_recent_downloads[:20]
 
-    if result.returncode == 0:
+    # En algunos entornos Windows/PowerShell el proceso puede reportar codigo != 0
+    # aun cuando la sincronizacion se completo. Validamos tambien por trazas de exito.
+    has_success_marker = any(
+      marker in combined_output
+      for marker in [
+        "Autenticacion completada correctamente.",
+        "Descarga de documentos notificados completada.",
+        "No hay notificaciones nuevas o pendientes por descargar.",
+      ]
+    )
+    has_fatal_traceback = "Traceback (most recent call last):" in combined_output
+
+    if result.returncode == 0 or (has_success_marker and not has_fatal_traceback):
       UPDATE_STATE["progress"] = 100
       if "No hay notificaciones nuevas o pendientes por descargar." in combined_output:
         UPDATE_STATE["message"] = f"{target_iso}: no hay nada nuevo para descargar."
@@ -175,7 +201,11 @@ def _run_update(target_date: str | None = None):
       else:
         UPDATE_STATE["message"] = f"{target_iso}: actualización completada."
     else:
-      UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}"
+      stderr_tail = "\n".join((result.stderr or "").splitlines()[-5:]).strip()
+      if stderr_tail:
+        UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}. {stderr_tail}"
+      else:
+        UPDATE_STATE["error"] = f"Proceso finalizado con código {result.returncode}"
       UPDATE_STATE["message"] = f"{target_iso}: la actualización terminó con error."
   except Exception as e:
     UPDATE_STATE["error"] = str(e)
